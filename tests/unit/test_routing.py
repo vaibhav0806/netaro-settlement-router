@@ -1,0 +1,174 @@
+import asyncio
+from decimal import Decimal
+
+import pytest
+
+from app.routing import (
+    Currency,
+    Edge,
+    InvalidRateGraph,
+    RateBook,
+    RouteHop,
+    RouteNotFound,
+    compute_routes,
+    generate_edges,
+)
+
+
+def test_selects_path_with_greatest_receiver_output():
+    edges = (
+        Edge(Currency.USD, Currency.PHP, "direct", Decimal("55")),
+        Edge(Currency.USD, Currency.EUR, "eur-lp", Decimal("0.92")),
+        Edge(Currency.EUR, Currency.PHP, "php-lp", Decimal("61")),
+    )
+
+    quote = compute_routes(edges, version=7)[Currency.PHP]
+
+    assert quote.aggregate_rate == Decimal("56.12")
+    assert tuple(hop.target for hop in quote.hops) == (Currency.EUR, Currency.PHP)
+    assert Decimal("100") * quote.aggregate_rate == Decimal("5612.00")
+
+
+def test_profitable_cycle_invalidates_snapshot():
+    edges = (
+        Edge(Currency.USD, Currency.EUR, "a", Decimal("0.9")),
+        Edge(Currency.EUR, Currency.USD, "b", Decimal("1.2")),
+    )
+
+    with pytest.raises(InvalidRateGraph):
+        compute_routes(edges, version=1)
+
+
+def test_selects_best_parallel_lp_edge():
+    edges = (
+        Edge(Currency.USD, Currency.PHP, "LP_A", Decimal("54")),
+        Edge(Currency.USD, Currency.PHP, "LP_B", Decimal("56")),
+        Edge(Currency.USD, Currency.PHP, "LP_C", Decimal("55")),
+    )
+
+    quote = compute_routes(edges, version=2)[Currency.PHP]
+
+    assert quote.aggregate_rate == Decimal("56")
+    assert tuple(hop.lp for hop in quote.hops) == ("LP_B",)
+
+
+def test_equal_product_route_is_stable_when_input_order_is_reversed():
+    edges = (
+        Edge(Currency.USD, Currency.EUR, "z", Decimal("2")),
+        Edge(Currency.EUR, Currency.PHP, "a", Decimal("3")),
+        Edge(Currency.USD, Currency.AED, "a", Decimal("3")),
+        Edge(Currency.AED, Currency.PHP, "z", Decimal("2")),
+    )
+
+    forward = compute_routes(edges, version=3)[Currency.PHP]
+    reversed_order = compute_routes(tuple(reversed(edges)), version=3)[Currency.PHP]
+
+    assert forward == reversed_order
+    assert tuple(hop.target for hop in forward.hops) == (Currency.AED, Currency.PHP)
+
+
+@pytest.mark.parametrize("rate", [Decimal("0"), Decimal("-0.01")])
+def test_rejects_non_positive_rates(rate):
+    edges = (Edge(Currency.USD, Currency.PHP, "LP_A", rate),)
+
+    with pytest.raises(InvalidRateGraph):
+        compute_routes(edges, version=1)
+
+
+def test_omits_disconnected_currency():
+    edges = (Edge(Currency.USD, Currency.EUR, "LP_A", Decimal("0.9")),)
+
+    routes = compute_routes(edges, version=4)
+
+    assert Currency.PHP not in routes
+
+
+def test_rate_book_publishes_and_quotes_one_complete_snapshot():
+    book = RateBook()
+    edges = (Edge(Currency.USD, Currency.PHP, "LP_A", Decimal("55")),)
+
+    snapshot = book.publish(edges, version=9)
+    quote = book.quote(Currency.PHP)
+
+    assert snapshot.version == 9
+    assert snapshot.routes[Currency.PHP] is quote
+    assert quote.snapshot_version == snapshot.version
+    assert quote.target == Currency.PHP
+    assert quote.aggregate_rate == Decimal("55")
+    assert quote.hops[0] == RouteHop(
+        Currency.USD, Currency.PHP, "LP_A", Decimal("55")
+    )
+
+
+def test_rate_book_raises_when_no_snapshot_or_route_exists():
+    book = RateBook()
+
+    with pytest.raises(RouteNotFound):
+        book.quote(Currency.PHP)
+
+    book.publish((Edge(Currency.USD, Currency.EUR, "LP_A", Decimal("0.9")),), 1)
+    with pytest.raises(RouteNotFound):
+        book.quote(Currency.PHP)
+
+
+def test_generate_edges_is_reproducible_and_cycle_safe():
+    first = generate_edges(11)
+
+    assert first == generate_edges(11)
+    assert first != generate_edges(12)
+    assert {edge.lp for edge in first} == {"LP_A", "LP_B", "LP_C"}
+    assert all(edge.rate > 0 for edge in first)
+    compute_routes(first, version=11)
+
+
+@pytest.mark.asyncio
+async def test_start_publishes_initial_snapshot_once():
+    calls = []
+
+    def edge_factory(version):
+        calls.append(version)
+        return (Edge(Currency.USD, Currency.PHP, "LP_A", Decimal(version)),)
+
+    book = RateBook(edge_factory=edge_factory, interval_seconds=60)
+    await book.start()
+    await book.start()
+
+    assert calls == [1]
+    assert book.quote(Currency.PHP).snapshot_version == 1
+    await book.stop()
+
+
+@pytest.mark.asyncio
+async def test_simulator_advances_snapshot_version():
+    advanced = asyncio.Event()
+
+    def edge_factory(version):
+        if version == 2:
+            advanced.set()
+        return (Edge(Currency.USD, Currency.PHP, "LP_A", Decimal(version)),)
+
+    book = RateBook(edge_factory=edge_factory, interval_seconds=0.001)
+    await book.start()
+    await asyncio.wait_for(advanced.wait(), timeout=1)
+
+    assert book.quote(Currency.PHP).snapshot_version >= 2
+    await book.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_is_idempotent_and_stops_publication():
+    calls = []
+
+    def edge_factory(version):
+        calls.append(version)
+        return (Edge(Currency.USD, Currency.PHP, "LP_A", Decimal(version)),)
+
+    book = RateBook(edge_factory=edge_factory, interval_seconds=0.001)
+    await book.start()
+    await asyncio.sleep(0.005)
+    await book.stop()
+    await book.stop()
+    calls_after_stop = len(calls)
+    await asyncio.sleep(0.005)
+
+    assert len(calls) == calls_after_stop
