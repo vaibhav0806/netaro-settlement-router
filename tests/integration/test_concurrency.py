@@ -24,33 +24,6 @@ from conftest import ScriptedPayoutProvider
 COMMAND = SettlementCreate(amount_usd=Decimal("20"), target_currency=Currency.PHP)
 
 
-async def reserve_amount(session_factory, key: str, amount: Decimal) -> None:
-    settlement_id = uuid4()
-    async with session_factory() as session:
-        settlement = Settlement(
-            id=settlement_id,
-            owner_id="customer",
-            idempotency_key=key,
-            request_fingerprint=f"fingerprint-{key}",
-            amount_usd=amount,
-            target_currency=Currency.PHP,
-            route=[],
-            snapshot_version=1,
-            aggregate_rate=Decimal("55"),
-            quoted_amount=amount * Decimal("55"),
-            provider_operation_id=settlement_id,
-            status=SettlementStatus.RESERVED,
-        )
-        session.add(settlement)
-        try:
-            await session.flush()
-            await reserve(session, settlement)
-            await session.commit()
-        except InsufficientFunds:
-            await session.rollback()
-            raise
-
-
 async def test_scripted_provider_reuses_stored_result_for_replayed_operation():
     settlement_id = uuid4()
     provider = ScriptedPayoutProvider(ProviderResult.PAID)
@@ -148,42 +121,82 @@ async def test_unique_requests_cannot_overspend_while_payouts_are_paused(
 
 
 async def test_mixed_concurrent_wave_exhausts_balance_and_rejects_remainder(
-    clean_database, session_factory
+    clean_database, session_factory, rate_book
 ):
     async with session_factory() as session:
         await seed_demo_accounts(session, "customer", Decimal("1000"))
         await session.commit()
     amounts = [
-        Decimal("375"),
-        Decimal("250"),
-        Decimal("125"),
-        Decimal("100"),
-        Decimal("75"),
-        Decimal("50"),
-        Decimal("25"),
-        Decimal("1001"),
+        Decimal("600"),
+        Decimal("400"),
+        Decimal("400"),
+        Decimal("200"),
+        Decimal("200"),
+        Decimal("200"),
     ]
-
-    results = await asyncio.gather(
-        *(
-            reserve_amount(session_factory, f"mixed-{index}", amount)
-            for index, amount in enumerate(amounts)
-        ),
-        return_exceptions=True,
-    )
-
-    assert results[:-1] == [None] * 7
-    assert isinstance(results[-1], InsufficientFunds)
-    async with session_factory() as session:
-        balances = (await session.scalars(select(Account.balance))).all()
-        reserved = await session.scalar(
-            select(Account.balance).where(
-                Account.owner_id == "customer",
-                Account.purpose == AccountPurpose.RESERVED,
+    provider = ScriptedPayoutProvider(ProviderResult.PAID, paused=True)
+    service = SettlementService(session_factory, rate_book, provider)
+    tasks = [
+        asyncio.create_task(
+            service.create(
+                "customer",
+                f"mixed-{index}",
+                SettlementCreate(
+                    amount_usd=amount, target_currency=Currency.PHP
+                ),
             )
         )
-    assert reserved == Decimal("1000")
-    assert all(value >= 0 for value in balances)
+        for index, amount in enumerate(amounts)
+    ]
+
+    async def wait_until_exhausted() -> list[Decimal]:
+        while True:
+            async with session_factory() as session:
+                balances = (await session.scalars(select(Account.balance))).all()
+                available = await session.scalar(
+                    select(Account.balance).where(
+                        Account.owner_id == "customer",
+                        Account.purpose == AccountPurpose.AVAILABLE,
+                    )
+                )
+            if available == Decimal("0"):
+                return balances
+            await asyncio.sleep(0.01)
+
+    try:
+        paused_balances = await asyncio.wait_for(
+            wait_until_exhausted(), timeout=20
+        )
+    finally:
+        provider.allow_initiate.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=20
+        )
+
+    successful_amounts = [
+        amount
+        for amount, result in zip(amounts, results)
+        if not isinstance(result, BaseException)
+    ]
+    assert sum(successful_amounts) == Decimal("1000")
+    assert all(
+        result.status == SettlementStatus.SUCCESS
+        for result in results
+        if not isinstance(result, BaseException)
+    )
+    assert any(isinstance(result, InsufficientFunds) for result in results)
+    assert all(amount <= Decimal("1000") for amount in amounts)
+    assert all(balance >= 0 for balance in paused_balances)
+    async with session_factory() as session:
+        final_balances = (await session.scalars(select(Account.balance))).all()
+        available = await session.scalar(
+            select(Account.balance).where(
+                Account.owner_id == "customer",
+                Account.purpose == AccountPurpose.AVAILABLE,
+            )
+        )
+    assert available == Decimal("0")
+    assert all(balance >= 0 for balance in final_balances)
 
 
 async def test_fifty_competing_success_finalizers_consume_once(

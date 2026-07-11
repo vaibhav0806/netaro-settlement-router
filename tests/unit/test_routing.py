@@ -1,4 +1,6 @@
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
 import pytest
@@ -144,8 +146,7 @@ def test_invalid_publication_preserves_last_valid_snapshot():
     assert book.quote(Currency.PHP) == original
 
 
-@pytest.mark.asyncio
-async def test_concurrent_readers_only_observe_complete_versions():
+def test_concurrent_readers_only_observe_complete_versions():
     book = RateBook()
     versions = {
         1: (Edge(Currency.USD, Currency.PHP, "direct", Decimal("55")),),
@@ -164,23 +165,47 @@ async def test_concurrent_readers_only_observe_complete_versions():
         for version, edges in versions.items()
         for quote in (compute_routes(edges, version)[Currency.PHP],)
     }
-    observed = set()
+    reader_count = 8
+    start = threading.Barrier(reader_count + 1, timeout=5)
+    observed_versions = {version: threading.Event() for version in versions}
+    publishing_done = threading.Event()
 
-    async def publish() -> None:
-        for index in range(200):
-            version = index % 2 + 1
-            book.publish(versions[version], version)
-            await asyncio.sleep(0)
+    def publish() -> None:
+        try:
+            start.wait()
+            for index in range(2_000):
+                version = index % 2 + 1
+                book.publish(versions[version], version)
+                if index < 2 and not observed_versions[version].wait(timeout=5):
+                    raise TimeoutError(f"readers did not observe version {version}")
+        finally:
+            publishing_done.set()
 
-    async def read() -> None:
-        for _ in range(400):
+    def read() -> set[tuple[object, ...]]:
+        observed = set()
+        start.wait()
+        for iteration in range(100_000):
             quote = book.quote(Currency.PHP)
             observed.add(
                 (quote.snapshot_version, quote.hops, quote.aggregate_rate)
             )
-            await asyncio.sleep(0)
+            observed_versions[quote.snapshot_version].set()
+            if iteration >= 4_000 and publishing_done.is_set():
+                break
+        else:
+            raise TimeoutError("publisher did not complete during reader stress")
+        return observed
 
-    await asyncio.gather(publish(), *(read() for _ in range(20)))
+    executor = ThreadPoolExecutor(max_workers=reader_count + 1)
+    futures = [executor.submit(publish)] + [
+        executor.submit(read) for _ in range(reader_count)
+    ]
+    try:
+        future_results = [future.result(timeout=10) for future in futures]
+    finally:
+        start.abort()
+        executor.shutdown(wait=True, cancel_futures=True)
+    observed = set().union(*(result for result in future_results[1:]))
 
     assert observed == expected
 

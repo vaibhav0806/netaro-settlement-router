@@ -86,9 +86,15 @@ async def test_concurrent_conflicting_payloads_have_one_winner(
     service = SettlementService(session_factory, rate_book, provider)
     requests = [command("40")] * 20 + [command("41")] * 20
 
-    results = await asyncio.gather(
-        *(service.create("customer", "contested", request) for request in requests),
-        return_exceptions=True,
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            *(
+                service.create("customer", "contested", request)
+                for request in requests
+            ),
+            return_exceptions=True,
+        ),
+        timeout=20,
     )
 
     winners = [result for result in results if not isinstance(result, BaseException)]

@@ -148,8 +148,9 @@ async def test_concurrent_unpaid_reconciliation_releases_once(
     )
     service, pending = await create_pending(session_factory, rate_book, provider)
 
-    results = await asyncio.gather(
-        *(service.reconcile(pending.id) for _ in range(50))
+    results = await asyncio.wait_for(
+        asyncio.gather(*(service.reconcile(pending.id) for _ in range(50))),
+        timeout=20,
     )
 
     assert all(result.status == SettlementStatus.FAILED for result in results)
