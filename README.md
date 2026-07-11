@@ -1,33 +1,114 @@
 # Netaro Settlement Router
 
-Netaro Router is a FastAPI/PostgreSQL service that selects the greatest-output
-FX route, reserves customer USD, and settles through an idempotent payout
-provider without holding database locks during provider I/O.
+Netaro Router is a FastAPI/PostgreSQL implementation of an atomic FX
+settlement loop. It selects the route that maximizes the receiver's output,
+reserves customer USD through a double-entry ledger, calls an idempotent mock
+payout provider without holding database locks, and deterministically handles
+success, definitive failure, and ambiguous timeout outcomes.
 
-The detailed design is in [ARCHITECTURE.md](ARCHITECTURE.md), and the accepted
-locking, routing, and failure decisions are in [ADR.md](ADR.md).
+## Important files
 
-## Quick start
+| File | Purpose |
+|---|---|
+| [SPEC.md](SPEC.md) | Original assignment and evaluation criteria |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Components, request flow, data model, state transitions, concurrency boundaries, and scaling design |
+| [ADR.md](ADR.md) | Accepted decisions for routing, database locking, ledger design, payout failure handling, and 10,000 RPS evolution |
+| [AUDIT.md](AUDIT.md) | Recorded unit, integration, Docker E2E, load-test, and ledger-invariant results with rerun commands |
+| [Settlement design](docs/superpowers/specs/2026-07-12-settlement-router-design.md) | Reviewed implementation design and assignment assumptions |
+| [Implementation plan](docs/superpowers/plans/2026-07-12-netaro-settlement-router.md) | Original TDD implementation sequence and requirement mapping |
+| [Docker E2E design](docs/superpowers/specs/2026-07-12-docker-e2e-audit-design.md) | Reviewed isolation, scenario, lifecycle, artifact, and audit design |
+| [Docker E2E plan](docs/superpowers/plans/2026-07-12-docker-e2e-audit.md) | End-to-end, lifecycle, concurrency, evidence, and audit plan |
+| [Application](app/) | FastAPI service, routing engine, payout provider, ledger, models, and settlement state machine |
+| [Database migration](alembic/versions/0001_initial.py) | PostgreSQL schema, constraints, indexes, and seeded ledger accounts |
+| [Automated tests](tests/) | Unit, PostgreSQL integration, isolated Docker E2E, and canonical load proof |
+| [Docker E2E runner](tests/e2e/run.py) | Fresh-project orchestration, health checks, lifecycle tests, invariant audit, redacted artifacts, and cleanup |
+| [1,000-request load proof](tests/load_test.py) | Concurrent HTTP workload followed by a read-only accounting and routing audit |
 
-Docker Compose migrates the database, seeds `demo-customer` with USD 100,000,
-and starts the API:
+## Architecture summary
+
+```text
+Client
+  -> FastAPI validation and owner-scoped idempotency
+  -> immutable in-memory FX snapshot lookup
+  -> short PostgreSQL transaction
+       settlement row + SELECT FOR UPDATE + reserve journal
+  -> commit before external I/O
+  -> mock payout provider using settlement UUID as operation ID
+  -> short PostgreSQL transaction
+       consume, release, or preserve reservation
+  -> SUCCESS | FAILED | PENDING_RECONCILIATION
+```
+
+Key correctness properties:
+
+- "Cheapest" means the maximum amount received in the target currency.
+- Bellman-Ford-style relaxation builds deterministic maximum-product routes
+  and rejects reachable profitable cycles. Snapshot construction is `O(VE)`;
+  serving a published quote is `O(1)` plus route materialization.
+- Rates publish as immutable snapshots every 50 ms. A settlement stores the
+  exact snapshot version, route, LPs, rates, aggregate rate, and quoted output.
+- Customer funds move between USD `AVAILABLE` and `RESERVED` accounts using
+  balanced double-entry journals. Successful payouts consume the reservation;
+  definitive failures release it.
+- The owner/idempotency-key database constraint and request fingerprint make
+  replay safe. Equivalent decimal inputs replay the original result; changed
+  payloads return `409`.
+- Account rows are locked in a deterministic order using `SELECT FOR UPDATE`.
+  Locks are held only in short database transactions, never during provider
+  calls.
+- A payout timeout is ambiguous. Funds remain reserved and the settlement
+  becomes `PENDING_RECONCILIATION`; the service does not immediately retry.
+  Reconciliation queries the original provider operation ID.
+- The health endpoint checks PostgreSQL and returns `200` with
+  `{"status":"ok"}` or `503` while the database is unavailable.
+
+The assignment intentionally ignores LP fees, liquidity capacity, slippage,
+and quote expiry. The ledger uses USD as its accounting currency; target
+currency values remain quote and audit metadata.
+
+## Prerequisites
+
+- Docker with Docker Compose v2
+- Python 3.12 for running tests from the host
+- Ports `8000` and `5432` available for the simplest Docker startup, or custom
+  `API_HOST_PORT` and `POSTGRES_HOST_PORT` values
+
+## Run the application
+
+Build the image, migrate PostgreSQL, seed `demo-customer` with USD 100,000, and
+start the API:
 
 ```bash
 docker compose up --build
 ```
 
-In another terminal, check readiness:
+In another terminal, wait for readiness:
 
 ```bash
 curl --fail http://localhost:8000/health
 ```
 
-The health response is `{"status":"ok"}`. The default demo payout provider
-uses a repeatable 70% paid, 15% definitively unpaid, and 15% timeout mix.
+Expected response:
 
-## API examples
+```json
+{"status":"ok"}
+```
 
-Create a settlement. Both `Idempotency-Key` and `X-Owner-ID` are required:
+The default mock provider produces 70% paid, 15% definitively unpaid, and 15%
+five-second timeout outcomes over each group of 20 unique operations.
+
+To stop the application while preserving its database volume:
+
+```bash
+docker compose down
+```
+
+Use `docker compose down -v` only when a clean database is required.
+
+## Exercise the API
+
+Both `Idempotency-Key` and `X-Owner-ID` are required when creating a
+settlement. Supported target currencies are `USDC`, `EUR`, `PHP`, and `AED`.
 
 ```bash
 curl --fail --request POST http://localhost:8000/settlements \
@@ -37,42 +118,64 @@ curl --fail --request POST http://localhost:8000/settlements \
   --data '{"amount_usd":"100","target_currency":"PHP"}'
 ```
 
-Use the returned UUID to read status or reconcile an ambiguous timeout:
+Use the returned settlement UUID to read its durable state:
 
 ```bash
 curl --fail http://localhost:8000/settlements/<settlement-uuid>
+```
+
+Reconcile an ambiguous timeout:
+
+```bash
 curl --fail --request POST \
   http://localhost:8000/settlements/<settlement-uuid>/reconcile
 ```
 
-Reconciliation performs provider lookup only for an existing ambiguous
-operation. It does not create a second payout.
+Reconciliation is idempotent. It performs provider lookup for the existing
+operation and never creates a second payout. Terminal settlements are returned
+unchanged.
 
-## Local development and tests
-
-Python 3.12 is required. Install the application and test dependencies, then
-run migrations and tests against PostgreSQL:
+## Install host test dependencies
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
+```
+
+The commands below use PostgreSQL port `55432` so the test database does not
+conflict with another local PostgreSQL instance.
+
+## Run unit and PostgreSQL integration tests
+
+Start only the database and apply the production migration:
+
+```bash
 POSTGRES_HOST_PORT=55432 docker compose up -d db
 DATABASE_URL=postgresql+asyncpg://netaro:netaro@localhost:55432/netaro \
   .venv/bin/alembic upgrade head
-DATABASE_URL=postgresql+asyncpg://netaro:netaro@localhost:55432/netaro \
-  .venv/bin/pytest tests/unit -q
-DATABASE_URL=postgresql+asyncpg://netaro:netaro@localhost:55432/netaro \
-  .venv/bin/pytest tests/integration -q
 ```
 
-Port `55432` keeps this project stack isolated from any PostgreSQL already on
-the default host port. Override `POSTGRES_HOST_PORT` consistently if needed.
+Run the complete default suite:
 
-## Isolated Docker end-to-end tests
+```bash
+POSTGRES_HOST_PORT=55432 \
+  .venv/bin/pytest tests/unit tests/integration -q
+```
 
-Each scenario builds the application, selects unused host ports, starts a
-fresh Compose project and volume, captures redacted evidence under
-`.artifacts/e2e/`, and always tears the project down:
+Or run the lanes separately:
+
+```bash
+.venv/bin/pytest tests/unit -q
+POSTGRES_HOST_PORT=55432 .venv/bin/pytest tests/integration -q
+```
+
+The integration fixtures create and destroy a separate `netaro_test` database.
+
+## Run isolated Docker E2E scenarios
+
+Each scenario selects unused host ports, builds the application, starts a
+fresh Compose project and volume, waits for exact health readiness, captures
+redacted evidence, and always removes its containers and volume.
 
 ```bash
 for scenario in \
@@ -86,67 +189,92 @@ do
 done
 ```
 
-The lifecycle scenario restarts the API, verifies terminal and ambiguous
-settlements survive, confirms an ambiguous payout is not retried, and checks
-that `/health` changes from `503` during a database outage back to `200` after
-recovery. Concurrency scenarios also run read-only ledger invariant queries.
+The scenarios cover:
 
-## Exact 1,000-request proof
+- API validation, disabled docs, stable error contracts, and health behavior;
+- quote arithmetic, changing rate snapshots, replay, conflicts, and 100
+  concurrent requests using the same idempotency key;
+- the exact 14/3/3 provider distribution across 20 concurrent requests;
+- 101 concurrent USD 1,000 settlements against USD 100,000 without overspend;
+- API restart persistence, provider-memory loss, ambiguous reconciliation,
+  database outage and recovery;
+- read-only checks for negative accounts, unbalanced journals, duplicate
+  owner/key rows, and duplicate settlement/event rows.
 
-The load proof is destructive to this project's Compose volume. It requires a
-clean volume so the opening journal and all settlement totals are exact. The
-`load` payout mode is explicit; normal startup never selects it.
+Evidence is written to `.artifacts/e2e/<run-id>/` and is intentionally ignored
+by Git. See [AUDIT.md](AUDIT.md) for the recorded run IDs.
+
+## Run the exact 1,000-request proof
+
+The canonical proof is destructive to its selected Compose volume. It uses a
+dedicated project name and ports below, leaving other Compose projects alone.
 
 ```bash
-POSTGRES_HOST_PORT=55432 docker compose down -v
-POSTGRES_HOST_PORT=55432 PAYOUT_MODE=load docker compose up --build -d
-curl --fail http://localhost:8000/health
-POSTGRES_HOST_PORT=55432 .venv/bin/python tests/load_test.py \
-  --base-url http://localhost:8000 \
+API_HOST_PORT=58080 POSTGRES_HOST_PORT=55433 PAYOUT_MODE=load \
+  docker compose -p netaro-load-audit up --build -d
+
+until curl --fail --silent http://127.0.0.1:58080/health >/dev/null; do
+  sleep 0.5
+done
+
+POSTGRES_HOST_PORT=55433 .venv/bin/python tests/load_test.py \
+  --base-url http://127.0.0.1:58080 \
   --requests 1000 \
   --concurrency 1000 \
   --amount 100
+
+API_HOST_PORT=58080 POSTGRES_HOST_PORT=55433 \
+  docker compose -p netaro-load-audit down -v --remove-orphans
 ```
 
-The runner sends 1,000 unique HTTP requests concurrently, waits for the 150
-five-second timeouts, and then opens a read-only PostgreSQL transaction. It
-fails nonzero on any status, journal, balance, idempotency, provider-operation,
-or routing mismatch. Every stored route is regenerated from
-`generate_edges(snapshot_version)` and checked for the exact path, LPs, rates,
-and receiver output; at least two snapshot versions must be present. A valid
-run ends with:
+The load program sends 1,000 unique HTTP requests concurrently, waits for all
+ambiguous timeouts, and audits PostgreSQL in a read-only transaction. It fails
+nonzero on any status distribution, balance, journal, idempotency,
+provider-operation, or routing mismatch. Every stored route is regenerated
+from its snapshot version and checked for exact receiver output.
+
+Expected final line:
 
 ```text
 PASS settlements=1000 success=700 failed=150 pending=150 settlement_journals=1850 available_usd=15000 reserved_usd=15000
 ```
 
-## Routing and assumptions
+## Audit summary
 
-Each immutable rate snapshot precomputes maximum-product USD routes with
-Bellman-Ford-style relaxation. Snapshot construction is `O(VE)`. This is the
-accepted correctness tradeoff for a cyclic multiplicative graph; request-time
-target lookup is `O(1)` plus at most `O(V)` route hops. The rationale and
-rejected BFS/Dijkstra alternatives are recorded in [ADR.md](ADR.md).
+The full evidence and coverage matrix are in [AUDIT.md](AUDIT.md). The recorded
+verification ran against source commit
+`9baac53d8b425a98c7b4a46b57ff40ea24e57044`.
 
-The ledger is USD-only. Target-currency values and routes are quote/audit
-metadata, not multi-currency postings. A provider `503` is treated as a
-definitive unpaid result and releases the reservation. A timeout is ambiguous:
-funds stay reserved in `PENDING_RECONCILIATION`, no automatic retry occurs, and
-reconciliation looks up the original provider operation ID.
+| Verification lane | Recorded result |
+|---|---:|
+| Unit tests | 40 passed |
+| PostgreSQL integration tests | 78 passed |
+| Combined unit and integration | 118 passed in 36.13s |
+| Isolated Docker E2E scenarios | 5 passed |
+| Canonical load workload | 1,000/1,000 requests completed |
+| Load duration | 10.08 seconds |
+| Provider outcomes | 700 success / 150 failed / 150 pending |
+| Routing snapshots exercised | 47 |
+| Ledger journals | 1 opening + 1,850 settlement journals |
+| Final available/reserved USD | 15,000 / 15,000 |
+| Negative accounts | 0 |
+| Unbalanced journal/currency groups | 0 |
+| Duplicate owner/key or settlement/event rows | 0 |
 
-## Four-hour scope boundary
+## Scope and production limits
 
-This submission does not implement real LP or payout integrations, fees,
-liquidity capacity, slippage, quote expiry, target-currency ledger valuation,
-authentication/authorization, a durable payout queue/outbox, distributed rate
-snapshots, horizontal worker partitioning, observability infrastructure, or a
-production reconciliation scheduler. The 10,000 RPS evolution is documented
-as architecture only; it is not claimed as implemented throughput.
+This submission prioritizes routing correctness, atomic reservation,
+double-entry accounting, concurrency control, idempotency, and ambiguous
+failure safety within the assignment's four-hour boundary.
 
-## Submission checklist
+It does not implement real LP or payout integrations, LP fees, liquidity
+capacity, slippage, quote expiry, target-currency ledger valuation,
+authentication/authorization, customer-account provisioning, a durable payout
+queue/outbox, a production reconciliation scheduler, distributed rate
+snapshots, horizontal worker partitioning, or production observability.
 
-- [ ] Add the repository URL to the submission form.
-- [ ] Add the unedited recording URL; do not substitute an edited demo.
-- [ ] Attach or paste the exact 1,000-request PASS output.
-- [ ] Link the accepted [ADR.md](ADR.md).
-- [ ] Confirm the recording and repository were produced within the four-hour window.
+The mock provider is process-local. After a restart, an ambiguous settlement
+remains safely reserved and pending, but a real deployment needs a durable
+provider operation/query API. The local Docker load result is a correctness
+proof, not a claim of production throughput. The proposed path to 10,000 RPS
+is documented in [ARCHITECTURE.md](ARCHITECTURE.md) and [ADR.md](ADR.md).
