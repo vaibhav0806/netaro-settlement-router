@@ -85,7 +85,8 @@ crash recovery.
 ## Settlement flow
 
 1. Validate the request and idempotency key. If the key already exists, return
-   it for the same request fingerprint and reject a different payload.
+   it for the same request fingerprint unless it is a recoverable `RESERVED`
+   row; reject a different payload.
 2. Read the latest valid rate snapshot and calculate the route and quoted
    output.
 3. In one short database transaction:
@@ -100,7 +101,8 @@ crash recovery.
 4. Lock and conditionally transition the settlement from `RESERVED` to
    `PAYOUT_IN_PROGRESS`, commit, and call the provider outside all database
    transactions and row locks. The settlement ID is the provider idempotency
-   key. Only the request that wins this transition may initiate the call.
+   key. Only the request that wins this transition may initiate the call. A
+   replay can use the same claim to recover a stranded `RESERVED` settlement.
 5. In a new short transaction, process the result:
    - `200`: consume the reservation and mark `SUCCESS`.
    - `503`: release the reservation and mark `FAILED`. This design assumes the
@@ -146,6 +148,9 @@ using the same provider idempotency key. It never blindly resubmits an existing
 or ambiguous operation. Finalization and reconciliation lock and recheck the
 settlement row before writing a unique settlement/event journal, so concurrent
 workers cannot consume or release the reservation twice.
+
+The provider operation ID is the settlement UUID and is persisted when the
+settlement is created, before payout initiation.
 
 ## API surface
 

@@ -114,14 +114,17 @@ RESERVED -> PAYOUT_IN_PROGRESS -> SUCCESS
 PENDING_RECONCILIATION --------> SUCCESS | FAILED
 ```
 
-The externally visible outcomes are `SUCCESS`, `FAILED`, and
+The three outcome states are `SUCCESS`, `FAILED`, and
 `PENDING_RECONCILIATION`; pending remains unresolved and can later transition.
-`RESERVED` and `PAYOUT_IN_PROGRESS` are persisted recovery states.
+`RESERVED` and `PAYOUT_IN_PROGRESS` are persisted recovery states. The status
+endpoint may expose either transient state during processing or after a crash;
+they are not additional final outcomes.
 
 ## Request and transaction flow
 
 1. Validate the request and build a canonical fingerprint. Return an existing
-   matching idempotency key immediately or reject a conflicting fingerprint.
+   matching idempotency key immediately unless it is recoverable `RESERVED`;
+   reject a conflicting fingerprint.
 2. Read one completed rate snapshot and calculate the selected quote.
 3. In a short `READ COMMITTED` transaction, insert the settlement and quote
    under the owner/idempotency unique constraint, lock affected accounts with
@@ -129,7 +132,8 @@ The externally visible outcomes are `SUCCESS`, `FAILED`, and
    reservation journal, update balances, and commit `RESERVED`. A concurrent
    insertion loser rolls back, reloads the winner, and does no financial work.
 4. Lock the settlement and conditionally transition `RESERVED` to
-   `PAYOUT_IN_PROGRESS`. Only the winner may invoke the provider.
+   `PAYOUT_IN_PROGRESS`. Only the winner may invoke the provider. A replay of a
+   crash-left `RESERVED` row participates in the same claim.
 5. Call the provider outside database transactions using the settlement ID as
    its idempotency key.
 6. In a new transaction, lock and recheck the settlement and account rows:
@@ -147,6 +151,9 @@ holding locks during the five-second provider timeout.
 If recovery finds `PAYOUT_IN_PROGRESS`, it first queries the provider. It may
 submit with the same idempotency key only when the provider definitively reports
 that no operation exists. It never resubmits an ambiguous operation.
+
+The provider operation ID is the settlement UUID, assigned and persisted when
+the settlement row is created. It is stable across replay and recovery.
 
 ## API
 

@@ -210,7 +210,7 @@ Implementation rules:
 5. On equal products, select the lexicographically smallest tuple of `(source, target, lp)`.
 6. Perform one additional relaxation and raise `InvalidRateGraph` if any USD-reachable candidate strictly improves.
 
-`RateBook.publish(edges)` computes a complete snapshot before replacing its single snapshot reference. `RateBook.quote(target)` returns the stored quote or raises `RouteNotFound`. Its simulator derives cross-rates for exactly `LP_A`, `LP_B`, and `LP_C` from currency anchor values and positive LP spreads, then publishes every `0.05` seconds so it does not accidentally generate profitable cycles.
+`RateBook.publish(edges)` computes a complete snapshot before replacing its single snapshot reference. `RateBook.quote(target)` returns the stored quote or raises `RouteNotFound`. A pure `generate_edges(version)` derives reproducible cross-rates for exactly `LP_A`, `LP_B`, and `LP_C` from currency anchor values and positive LP spreads. The simulator publishes a new version every `0.05` seconds, so rates fluctuate without accidentally generating profitable cycles and the load audit can reconstruct any persisted snapshot.
 
 - [ ] **Step 4: Run and extend routing tests**
 
@@ -265,7 +265,7 @@ class SettlementStatus(StrEnum):
 Create SQLAlchemy models with UUID primary keys and `NUMERIC(24, 8)` monetary/rate columns:
 
 - `accounts`: non-null `owner_id` (use `system` for omnibus accounts), `currency`, `account_class`, `purpose`, `balance`; unique `(owner_id, currency, purpose)`; `balance >= 0`.
-- `settlements`: owner/key/fingerprint, USD amount, target, JSON route, snapshot version, aggregate rate, quoted amount, provider ID, status/timestamps; unique `(owner_id, idempotency_key)`; positive amount/rate/quote checks.
+- `settlements`: owner/key/fingerprint, USD amount, target, JSON route, snapshot version, aggregate rate, quoted amount, provider operation ID equal to the settlement UUID, status/timestamps; unique `(owner_id, idempotency_key)`; positive amount/rate/quote checks.
 - `journal_transactions`: nullable settlement ID and event; unique `(settlement_id, event)` for non-opening events.
 - `postings`: journal/account/currency/side/amount; `amount > 0`.
 
@@ -417,6 +417,7 @@ Implement a concurrency-safe `ScriptedPayoutProvider` fixture with explicit init
 - Success: USD 40 from available USD 100 leaves available 60, reserved 0, one `RESERVE`, one `CONSUME`, status `SUCCESS`.
 - `503`/unpaid: available returns to 100, reserved 0, one `RELEASE`, status `FAILED`.
 - Timeout: available 60, reserved 40, no terminal journal, exactly one initiation, status `PENDING_RECONCILIATION`.
+- Crash-left `RESERVED`: same-payload replay wins the conditional claim, continues payout once, and creates no second reservation.
 - Same owner/key/payload: same settlement/quote, one reserve, one provider initiation.
 - Same owner/key with changed amount or target: `IdempotencyConflict`, original unchanged.
 - 100 simultaneous same-key calls: one settlement, one reserve, one provider initiation.
@@ -461,14 +462,24 @@ class SettlementService:
 
 `create()` follows this exact sequence:
 
-1. Query existing owner/key; compare fingerprint and return immediately on replay.
+1. Query existing owner/key and compare fingerprints. Return terminal or
+   `PAYOUT_IN_PROGRESS` rows immediately. A replay of `RESERVED` continues to
+   the conditional claim in step 4.
 2. Capture one `RateBook` quote and build the complete route JSON.
-3. In a short transaction, insert settlement and call `reserve()`. On unique violation, rollback, reload the winner, compare fingerprint, and return without invoking payout.
+3. In a short transaction, assign one UUID to both settlement ID and provider
+   operation ID, insert the settlement, and call `reserve()`. On unique
+   violation, rollback, reload the winner, compare fingerprints, and follow
+   step 1 based on its persisted state.
 4. In a second transaction, lock the settlement and conditionally change `RESERVED` to `PAYOUT_IN_PROGRESS`; only the winner continues.
 5. Close the transaction/session before awaiting `provider.initiate()`.
 6. In a third transaction, lock the settlement, recheck `PAYOUT_IN_PROGRESS`, then consume/`SUCCESS`, release/`FAILED`, or retain/`PENDING_RECONCILIATION`.
 
 `reconcile()` performs provider lookup outside a transaction, then locks and rechecks the settlement before exactly one consume/release. `UNKNOWN` preserves pending state. For crash-left `PAYOUT_IN_PROGRESS`, query first; `PAID`/`UNPAID` finalize, `UNKNOWN` remains unchanged, and only definitive `NOT_FOUND` permits one idempotent initiation.
+
+`SettlementRead.status` may contain `RESERVED` or `PAYOUT_IN_PROGRESS` while a
+request is active or crash-left. Those are observable processing states, not
+additional final outcomes; the only outcome states remain `SUCCESS`, `FAILED`,
+and `PENDING_RECONCILIATION`.
 
 - [ ] **Step 5: Run concurrency tests repeatedly**
 
@@ -608,6 +619,11 @@ Operation IDs remain deduplicated, so replay does not increment the counter. Kee
 2. Send 1,000 concurrent unique-key requests of USD 100 with concurrency 1,000 and `X-Owner-ID: demo-customer`.
 3. Wait for all synchronous responses, including the 150 five-second timeouts.
 4. Query PostgreSQL read-only and fail nonzero unless all expected values match.
+5. For every settlement, regenerate edges for its persisted snapshot version,
+   recompute the optimal target route, and assert exact equality of stored path,
+   LPs, aggregate rate, and `amount_usd * aggregate_rate`. Require at least two
+   distinct snapshot versions across the 1,000 requests to prove routing stayed
+   internally consistent while rates changed.
 
 Exact expectations:
 
