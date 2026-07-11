@@ -116,6 +116,38 @@ def test_wait_for_health_times_out_without_declaring_success(tmp_path):
     assert '200 {"status": "ok"}' not in (tmp_path / "readiness.log").read_text()
 
 
+@pytest.mark.parametrize("body", [b"not-json", b"\xff"])
+def test_malformed_successful_health_body_times_out_cleanly(
+    monkeypatch, tmp_path, body
+):
+    config = make_config(tmp_path)
+    times = iter([0.0, 1.1])
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return body
+
+    monkeypatch.setattr(run, "urlopen", lambda *args, **kwargs: Response())
+
+    with pytest.raises(TimeoutError, match="health endpoint"):
+        run.wait_for_health(
+            config,
+            timeout_seconds=1,
+            monotonic=lambda: next(times),
+            sleep=lambda _: None,
+        )
+
+    assert "invalid JSON" in (tmp_path / "readiness.log").read_text()
+
+
 @pytest.mark.parametrize("scenario_code", [0, 7])
 def test_artifacts_are_captured_before_teardown_on_every_outcome(
     monkeypatch, tmp_path, scenario_code
@@ -195,6 +227,43 @@ def test_teardown_runs_when_startup_raises(monkeypatch, tmp_path):
     )
 
 
+def test_teardown_runs_if_capture_and_capture_error_write_both_raise(
+    monkeypatch, tmp_path
+):
+    config = make_config(tmp_path)
+    commands: list[list[str]] = []
+    capture_failed = False
+    original_open = Path.open
+
+    def fake_subprocess(command, *, env=None, capture_output, text):
+        commands.append(command)
+        return completed(command)
+
+    def fail_capture(*args, **kwargs):
+        nonlocal capture_failed
+        capture_failed = True
+        raise RuntimeError("capture failed")
+
+    def fail_capture_error_write(path, *args, **kwargs):
+        if capture_failed and path.name == "scenario.stderr":
+            raise OSError("artifact filesystem failed")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(run.subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(run, "wait_for_health", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run, "capture_artifacts", fail_capture)
+    monkeypatch.setattr(Path, "open", fail_capture_error_write)
+
+    result = run.run_scenario(
+        run.ScenarioSpec("boot-contract", "load", "boot_contract"), config=config
+    )
+
+    assert result == 1
+    assert commands[-1] == run.compose_command(
+        config, "down", "-v", "--remove-orphans"
+    )
+
+
 def test_port_selection_never_returns_the_same_port_twice(monkeypatch):
     candidates = iter([41000, 41000, 41001])
     monkeypatch.setattr(run, "_candidate_port", lambda: next(candidates))
@@ -207,8 +276,10 @@ def test_up_retries_with_fresh_ports_only_for_proven_bind_collision(
 ):
     config = make_config(tmp_path)
     up_environments: list[dict[str, str]] = []
+    calls: list[tuple[list[str], dict[str, str]]] = []
 
     def fake_subprocess(command, *, env=None, capture_output, text):
+        calls.append((command, env or {}))
         if "up" in command:
             up_environments.append(env)
             if len(up_environments) == 1:
@@ -229,6 +300,8 @@ def test_up_retries_with_fresh_ports_only_for_proven_bind_collision(
     assert len(up_environments) == 2
     assert up_environments[1]["API_HOST_PORT"] == "49001"
     assert up_environments[1]["POSTGRES_HOST_PORT"] == "49002"
+    cleanup = run.compose_command(config, "down", "-v", "--remove-orphans")
+    assert [command for command, _ in calls if command == cleanup] == [cleanup, cleanup]
 
 
 def test_up_does_not_retry_an_unrelated_failure(monkeypatch, tmp_path):
@@ -238,7 +311,11 @@ def test_up_does_not_retry_an_unrelated_failure(monkeypatch, tmp_path):
     def fake_subprocess(command, *, env=None, capture_output, text):
         if "up" in command:
             up_commands.append(command)
-            return completed(command, 4, stderr="image build failed")
+            return completed(
+                command,
+                4,
+                stderr="build helper reports address already in use",
+            )
         return completed(command)
 
     monkeypatch.setattr(run.subprocess, "run", fake_subprocess)
@@ -249,6 +326,77 @@ def test_up_does_not_retry_an_unrelated_failure(monkeypatch, tmp_path):
 
     assert result == 4
     assert len(up_commands) == 1
+
+
+def test_all_persisted_process_output_and_errors_are_redacted(monkeypatch, tmp_path):
+    config = make_config(tmp_path)
+    secret = "never-persist-this"
+    password_url = f"postgresql://netaro:{secret}@db:5432/netaro"
+
+    def fake_subprocess(command, *, env=None, capture_output, text):
+        if "up" in command:
+            return completed(
+                command,
+                stdout=f"up-stdout {password_url}\n",
+                stderr=f"up-stderr\nPOSTGRES_PASSWORD: {secret}\n",
+            )
+        if "pytest" in command:
+            return completed(
+                command,
+                stdout=f"scenario-stdout {password_url}\n",
+                stderr=f"scenario-stderr\nPOSTGRES_PASSWORD: {secret}\n",
+            )
+        if "down" in command:
+            return completed(
+                command,
+                stdout=f"down-stdout {password_url}\n",
+                stderr=f"down-stderr\nPOSTGRES_PASSWORD: {secret}\n",
+            )
+        return completed(
+            command,
+            stdout=f"capture-output {password_url}\nPOSTGRES_PASSWORD: {secret}\n",
+        )
+
+    monkeypatch.setattr(run.subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(run, "wait_for_health", lambda *args, **kwargs: None)
+
+    result = run.run_scenario(
+        run.ScenarioSpec("boot-contract", "load", "boot_contract"), config=config
+    )
+
+    assert result == 0
+    artifacts = {
+        path.name: path.read_text()
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    }
+    assert all(secret not in contents for contents in artifacts.values())
+    assert "up-stdout" in artifacts["readiness.log"]
+    assert "up-stderr" in artifacts["readiness.log"]
+    assert "scenario-stdout" in artifacts["scenario.stdout"]
+    assert "scenario-stderr" in artifacts["scenario.stderr"]
+    assert "capture-output" in artifacts["compose-config.yml"]
+    assert "down-stdout" in artifacts["teardown.txt"]
+    assert "down-stderr" in artifacts["teardown.txt"]
+
+
+def test_persisted_lifecycle_error_is_redacted(monkeypatch, tmp_path):
+    config = make_config(tmp_path)
+    secret = "never-persist-this"
+
+    def fail_health(*args, **kwargs):
+        raise TimeoutError(f"postgresql://netaro:{secret}@db:5432/netaro")
+
+    monkeypatch.setattr(run.subprocess, "run", lambda command, **kwargs: completed(command))
+    monkeypatch.setattr(run, "wait_for_health", fail_health)
+
+    result = run.run_scenario(
+        run.ScenarioSpec("boot-contract", "load", "boot_contract"), config=config
+    )
+
+    assert result == 1
+    assert secret not in (tmp_path / "scenario.stderr").read_text()
+    assert "REDACTED" in (tmp_path / "scenario.stderr").read_text()
 
 
 def test_capture_artifacts_creates_contract_files_and_redacts_compose_config(

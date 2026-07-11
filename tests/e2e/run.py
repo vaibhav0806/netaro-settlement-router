@@ -77,8 +77,8 @@ ARTIFACT_NAMES = (
 )
 PORT_COLLISION_PATTERNS = (
     "port is already allocated",
-    "address already in use",
-    "failed to bind host port",
+    "bind for",
+    "failed to bind",
 )
 
 
@@ -140,7 +140,11 @@ def _initialize_artifacts(config: RunConfig) -> None:
 def _default_health_request(url: str) -> tuple[int, object]:
     try:
         with urlopen(url, timeout=2) as response:
-            return response.status, json.loads(response.read())
+            try:
+                body: object = json.loads(response.read())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                body = "invalid JSON"
+            return response.status, body
     except HTTPError as error:
         try:
             body: object = json.loads(error.read())
@@ -185,6 +189,12 @@ def _redact(text: str) -> str:
         r"\1REDACTED",
         text,
     )
+    text = re.sub(
+        r"(?i)(\b[\w-]*password[\w-]*\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)",
+        r"\1REDACTED",
+        text,
+    )
     return re.sub(
         r"(?i)([a-z][a-z0-9+.-]*://[^\s:/@]+:)([^\s@]+)(@)",
         r"\1REDACTED\3",
@@ -192,17 +202,23 @@ def _redact(text: str) -> str:
     )
 
 
+def _persist(path: Path, text: str, *, append: bool = False) -> None:
+    mode = "a" if append else "w"
+    with path.open(mode) as output:
+        output.write(_redact(text))
+
+
 def _command_output(command: list[str], config: RunConfig) -> str:
     try:
         result = _run(command, env=_environment(config))
     except OSError as error:
-        return f"command failed: {error}\n"
+        return _redact(f"command failed: {error}\n")
     output = result.stdout
     if result.stderr:
         output += result.stderr
     if result.returncode:
         output += f"exit_code={result.returncode}\n"
-    return output
+    return _redact(output)
 
 
 def capture_artifacts(
@@ -289,79 +305,136 @@ def _scenario_command(spec: ScenarioSpec) -> list[str]:
 
 def run_scenario(spec: ScenarioSpec, *, config: RunConfig | None = None) -> int:
     active_config = config or _new_config(spec)
-    _initialize_artifacts(active_config)
     started_at = datetime.now(UTC)
     outcome = 1
 
     try:
-        for attempt in range(3):
-            up = _run(
-                compose_command(active_config, "up", "-d", "--build"),
-                env=_environment(active_config),
-            )
-            if up.returncode == 0:
-                break
-            if not _is_port_collision(up.stderr) or attempt == 2:
-                (active_config.artifact_dir / "scenario.stderr").write_text(up.stderr)
-                return up.returncode or 1
-            cleanup = _run(
-                compose_command(active_config, "down", "-v", "--remove-orphans"),
-                env=_environment(active_config),
-            )
-            with (active_config.artifact_dir / "teardown.txt").open("a") as teardown:
-                teardown.write(cleanup.stdout + cleanup.stderr)
-            api_port, postgres_port = _fresh_ports()
-            active_config = replace(
-                active_config,
-                api_host_port=api_port,
-                postgres_host_port=postgres_port,
-            )
-
-        wait_for_health(active_config)
-        scenario_environment = _environment(active_config)
-        scenario_environment.update(
-            {
-                "E2E_BASE_URL": f"http://127.0.0.1:{active_config.api_host_port}",
-                "E2E_SCENARIO": spec.name,
-                "E2E_ARTIFACT_DIR": str(active_config.artifact_dir.resolve()),
-            }
-        )
-        scenario = _run(_scenario_command(spec), env=scenario_environment)
-        (active_config.artifact_dir / "scenario.stdout").write_text(scenario.stdout)
-        (active_config.artifact_dir / "scenario.stderr").write_text(scenario.stderr)
-        outcome = scenario.returncode
-    except (OSError, TimeoutError) as error:
-        with (active_config.artifact_dir / "scenario.stderr").open("a") as stderr:
-            stderr.write(f"{type(error).__name__}: {error}\n")
-        outcome = 1
-    finally:
         try:
-            capture_artifacts(
-                active_config,
-                started_at=started_at,
-                finished_at=datetime.now(UTC),
-            )
-        except Exception as error:
-            with (active_config.artifact_dir / "scenario.stderr").open("a") as stderr:
-                stderr.write(f"artifact capture failed: {error}\n")
-            if outcome == 0:
-                outcome = 1
+            _initialize_artifacts(active_config)
+            startup_succeeded = False
+            for attempt in range(3):
+                up = _run(
+                    compose_command(active_config, "up", "-d", "--build"),
+                    env=_environment(active_config),
+                )
+                _persist(
+                    active_config.artifact_dir / "readiness.log",
+                    up.stdout + up.stderr,
+                    append=True,
+                )
+                if up.returncode == 0:
+                    startup_succeeded = True
+                    break
+                if not _is_port_collision(up.stderr) or attempt == 2:
+                    _persist(
+                        active_config.artifact_dir / "scenario.stdout", up.stdout
+                    )
+                    _persist(
+                        active_config.artifact_dir / "scenario.stderr", up.stderr
+                    )
+                    outcome = up.returncode or 1
+                    break
+                cleanup = _run(
+                    compose_command(
+                        active_config, "down", "-v", "--remove-orphans"
+                    ),
+                    env=_environment(active_config),
+                )
+                _persist(
+                    active_config.artifact_dir / "teardown.txt",
+                    cleanup.stdout + cleanup.stderr,
+                    append=True,
+                )
+                api_port, postgres_port = _fresh_ports()
+                active_config = replace(
+                    active_config,
+                    api_host_port=api_port,
+                    postgres_host_port=postgres_port,
+                )
 
+            if startup_succeeded:
+                wait_for_health(active_config)
+                scenario_environment = _environment(active_config)
+                scenario_environment.update(
+                    {
+                        "E2E_BASE_URL": (
+                            f"http://127.0.0.1:{active_config.api_host_port}"
+                        ),
+                        "E2E_SCENARIO": spec.name,
+                        "E2E_ARTIFACT_DIR": str(
+                            active_config.artifact_dir.resolve()
+                        ),
+                    }
+                )
+                scenario = _run(
+                    _scenario_command(spec), env=scenario_environment
+                )
+                _persist(
+                    active_config.artifact_dir / "scenario.stdout",
+                    scenario.stdout,
+                )
+                _persist(
+                    active_config.artifact_dir / "scenario.stderr",
+                    scenario.stderr,
+                )
+                outcome = scenario.returncode
+        except (OSError, TimeoutError) as error:
+            try:
+                _persist(
+                    active_config.artifact_dir / "scenario.stderr",
+                    f"{type(error).__name__}: {error}\n",
+                    append=True,
+                )
+            except OSError:
+                pass
+            outcome = 1
+        finally:
+            try:
+                capture_artifacts(
+                    active_config,
+                    started_at=started_at,
+                    finished_at=datetime.now(UTC),
+                )
+            except Exception as error:
+                try:
+                    _persist(
+                        active_config.artifact_dir / "scenario.stderr",
+                        f"artifact capture failed: {error}\n",
+                        append=True,
+                    )
+                except OSError:
+                    pass
+                if outcome == 0:
+                    outcome = 1
+    finally:
         try:
             teardown = _run(
                 compose_command(active_config, "down", "-v", "--remove-orphans"),
                 env=_environment(active_config),
             )
-            with (active_config.artifact_dir / "teardown.txt").open("a") as output:
-                output.write(teardown.stdout + teardown.stderr)
-                output.write(f"exit_code={teardown.returncode}\n")
             if outcome == 0 and teardown.returncode:
                 outcome = teardown.returncode
+            try:
+                _persist(
+                    active_config.artifact_dir / "teardown.txt",
+                    teardown.stdout
+                    + teardown.stderr
+                    + f"exit_code={teardown.returncode}\n",
+                    append=True,
+                )
+            except OSError:
+                pass
         except OSError as error:
-            with (active_config.artifact_dir / "teardown.txt").open("a") as output:
-                output.write(f"teardown failed: {error}\n")
             if outcome == 0:
                 outcome = 1
+            try:
+                _persist(
+                    active_config.artifact_dir / "teardown.txt",
+                    f"teardown failed: {error}\n",
+                    append=True,
+                )
+            except OSError:
+                pass
 
     return outcome
 
