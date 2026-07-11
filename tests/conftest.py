@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections import deque
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -19,8 +20,13 @@ from app.routing import Currency, Edge, RateBook
 from app.seed import seed_demo_accounts
 
 
-TEST_DATABASE_URL = "postgresql+asyncpg://netaro:netaro@localhost:5432/netaro_test"
-ADMIN_DATABASE_URL = "postgresql+asyncpg://netaro:netaro@localhost:5432/netaro"
+POSTGRES_HOST_PORT = os.getenv("POSTGRES_HOST_PORT", "5432")
+TEST_DATABASE_URL = (
+    f"postgresql+asyncpg://netaro:netaro@localhost:{POSTGRES_HOST_PORT}/netaro_test"
+)
+ADMIN_DATABASE_URL = (
+    f"postgresql+asyncpg://netaro:netaro@localhost:{POSTGRES_HOST_PORT}/netaro"
+)
 
 
 @pytest_asyncio.fixture(scope="session")

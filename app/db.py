@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 
 DATABASE_URL = os.getenv(
@@ -15,6 +17,20 @@ DATABASE_URL = os.getenv(
 
 engine = create_async_engine(DATABASE_URL)
 SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class DatabaseUnavailable(Exception):
+    pass
+
+
+async def check_database(
+    sessions: async_sessionmaker[AsyncSession] = SessionFactory,
+) -> None:
+    try:
+        async with sessions() as session:
+            await session.execute(text("SELECT 1"))
+    except SQLAlchemyError as error:
+        raise DatabaseUnavailable from error
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
