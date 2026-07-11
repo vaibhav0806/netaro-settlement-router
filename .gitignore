@@ -1,0 +1,11 @@
+.env
+.venv/
+.worktrees/
+.superpowers/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.coverage
+htmlcov/
+.DS_Store
