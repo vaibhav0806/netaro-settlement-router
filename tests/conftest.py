@@ -1,5 +1,8 @@
+import asyncio
+from collections import deque
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from uuid import UUID
 
 import pytest_asyncio
 from sqlalchemy import text
@@ -11,6 +14,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from app.models import Base
+from app.provider import PayoutProvider, PayoutTimeout, ProviderLookup, ProviderResult
+from app.routing import Currency, Edge, RateBook
 from app.seed import seed_demo_accounts
 
 
@@ -70,3 +75,64 @@ async def seeded_accounts(
     async with session_factory() as session:
         await seed_demo_accounts(session, "customer", Decimal("1000"))
         await session.commit()
+
+
+class ScriptedPayoutProvider(PayoutProvider):
+    def __init__(
+        self,
+        initial_result: ProviderResult | PayoutTimeout,
+        lookup_results: tuple[ProviderLookup, ...] = (),
+        *,
+        paused: bool = False,
+    ) -> None:
+        self.initial_result = initial_result
+        self.lookup_results = deque(lookup_results)
+        self.initiate_calls: list[UUID] = []
+        self.lookup_calls: list[UUID] = []
+        self.effective_operations: set[UUID] = set()
+        self.initiate_started = asyncio.Event()
+        self.allow_initiate = asyncio.Event()
+        if not paused:
+            self.allow_initiate.set()
+        self._lock = asyncio.Lock()
+        self._initiation_condition = asyncio.Condition(self._lock)
+
+    async def initiate(
+        self,
+        settlement_id: UUID,
+        amount_usd: Decimal,
+        target_currency: Currency,
+        quoted_amount: Decimal,
+    ) -> ProviderResult:
+        async with self._initiation_condition:
+            self.initiate_calls.append(settlement_id)
+            self.effective_operations.add(settlement_id)
+            self.initiate_started.set()
+            self._initiation_condition.notify_all()
+        await self.allow_initiate.wait()
+        if isinstance(self.initial_result, PayoutTimeout):
+            raise PayoutTimeout(str(self.initial_result))
+        return self.initial_result
+
+    async def lookup(self, settlement_id: UUID) -> ProviderLookup:
+        async with self._lock:
+            self.lookup_calls.append(settlement_id)
+            if self.lookup_results:
+                return self.lookup_results.popleft()
+        return ProviderLookup.UNKNOWN
+
+    async def wait_for_initiations(self, count: int) -> None:
+        async with self._initiation_condition:
+            await self._initiation_condition.wait_for(
+                lambda: len(self.initiate_calls) >= count
+            )
+
+
+@pytest_asyncio.fixture
+async def rate_book() -> RateBook:
+    rates = RateBook()
+    rates.publish(
+        (Edge(Currency.USD, Currency.PHP, "LP_TEST", Decimal("55")),),
+        version=7,
+    )
+    return rates
