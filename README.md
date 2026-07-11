@@ -66,6 +66,28 @@ The assignment intentionally ignores LP fees, liquidity capacity, slippage,
 and quote expiry. The ledger uses USD as its accounting currency; target
 currency values remain quote and audit metadata.
 
+## Audit summary
+
+The full evidence and coverage matrix are in [AUDIT.md](AUDIT.md). The recorded
+verification ran against source commit
+`9baac53d8b425a98c7b4a46b57ff40ea24e57044`.
+
+| Verification lane | Recorded result |
+|---|---:|
+| Unit tests | 40 passed |
+| PostgreSQL integration tests | 78 passed |
+| Combined unit and integration | 118 passed in 36.13s |
+| Isolated Docker E2E scenarios | 5 passed |
+| Canonical load workload | 1,000/1,000 requests completed |
+| Load duration | 10.08 seconds |
+| Provider outcomes | 700 success / 150 failed / 150 pending |
+| Routing snapshots exercised | 47 |
+| Ledger journals | 1 opening + 1,850 settlement journals |
+| Final available/reserved USD | 15,000 / 15,000 |
+| Negative accounts | 0 |
+| Unbalanced journal/currency groups | 0 |
+| Duplicate owner/key or settlement/event rows | 0 |
+
 ## Prerequisites
 
 - Docker with Docker Compose v2
@@ -238,28 +260,6 @@ Expected final line:
 ```text
 PASS settlements=1000 success=700 failed=150 pending=150 settlement_journals=1850 available_usd=15000 reserved_usd=15000
 ```
-
-## Audit summary
-
-The full evidence and coverage matrix are in [AUDIT.md](AUDIT.md). The recorded
-verification ran against source commit
-`9baac53d8b425a98c7b4a46b57ff40ea24e57044`.
-
-| Verification lane | Recorded result |
-|---|---:|
-| Unit tests | 40 passed |
-| PostgreSQL integration tests | 78 passed |
-| Combined unit and integration | 118 passed in 36.13s |
-| Isolated Docker E2E scenarios | 5 passed |
-| Canonical load workload | 1,000/1,000 requests completed |
-| Load duration | 10.08 seconds |
-| Provider outcomes | 700 success / 150 failed / 150 pending |
-| Routing snapshots exercised | 47 |
-| Ledger journals | 1 opening + 1,850 settlement journals |
-| Final available/reserved USD | 15,000 / 15,000 |
-| Negative accounts | 0 |
-| Unbalanced journal/currency groups | 0 |
-| Duplicate owner/key or settlement/event rows | 0 |
 
 ## Scope and production limits
 
