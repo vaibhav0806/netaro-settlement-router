@@ -28,4 +28,11 @@ exclude = ["alembic*", "tests*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests/unit", "tests/integration"]
+markers = [
+  "boot_contract: Docker boot and public contract",
+  "settlement_idempotency: Docker quote and replay behavior",
+  "provider_reconciliation: Docker provider outcome behavior",
+  "concurrency_funds: Docker overspend behavior",
+  "lifecycle_recovery: Docker restart and outage behavior",
+]

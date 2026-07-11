@@ -23,7 +23,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://netaro:netaro@db:5432/netaro
       PAYOUT_MODE: ${PAYOUT_MODE:-random}
     ports:
-      - "8000:8000"
+      - "${API_HOST_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy

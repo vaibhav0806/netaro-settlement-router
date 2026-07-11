@@ -2,6 +2,7 @@
 .venv/
 .worktrees/
 .superpowers/
+.artifacts/
 __pycache__/
 .pytest_cache/
 *.py[cod]
