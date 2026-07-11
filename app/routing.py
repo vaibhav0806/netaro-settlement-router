@@ -1,9 +1,17 @@
+"""Deterministic FX routing and in-memory rate snapshots.
+
+Snapshot construction uses Bellman-Ford-style relaxation and is O(VE), an
+intentional difference from the general O(V+E) target in the specification.
+Serving a quote from a published snapshot is O(1), plus use of its route hops.
+"""
+
 import asyncio
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
 
 
 class Currency(StrEnum):
@@ -112,11 +120,13 @@ def compute_routes(
     ):
         raise InvalidRateGraph("profitable cycle is reachable from source")
 
-    return {
-        target: RouteQuote(version, target, aggregate_rate, hops)
-        for target, (aggregate_rate, hops) in best.items()
-        if target != source
-    }
+    return MappingProxyType(
+        {
+            target: RouteQuote(version, target, aggregate_rate, hops)
+            for target, (aggregate_rate, hops) in best.items()
+            if target != source
+        }
+    )
 
 
 def generate_edges(version: int) -> tuple[Edge, ...]:

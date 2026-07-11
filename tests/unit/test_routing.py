@@ -52,6 +52,17 @@ def test_selects_best_parallel_lp_edge():
     assert tuple(hop.lp for hop in quote.hops) == ("LP_B",)
 
 
+def test_equal_parallel_rates_select_smallest_lp_when_input_is_reversed():
+    edges = (
+        Edge(Currency.USD, Currency.PHP, "LP_A", Decimal("55")),
+        Edge(Currency.USD, Currency.PHP, "LP_B", Decimal("55")),
+    )
+
+    quote = compute_routes(tuple(reversed(edges)), version=2)[Currency.PHP]
+
+    assert tuple(hop.lp for hop in quote.hops) == ("LP_A",)
+
+
 def test_equal_product_route_is_stable_when_input_order_is_reversed():
     edges = (
         Edge(Currency.USD, Currency.EUR, "z", Decimal("2")),
@@ -100,6 +111,15 @@ def test_rate_book_publishes_and_quotes_one_complete_snapshot():
     )
 
 
+def test_published_snapshot_routes_cannot_be_mutated():
+    book = RateBook()
+    edges = (Edge(Currency.USD, Currency.PHP, "LP_A", Decimal("55")),)
+    snapshot = book.publish(edges, version=9)
+
+    with pytest.raises(TypeError):
+        snapshot.routes[Currency.PHP] = snapshot.routes[Currency.PHP]
+
+
 def test_rate_book_raises_when_no_snapshot_or_route_exists():
     book = RateBook()
 
@@ -113,10 +133,23 @@ def test_rate_book_raises_when_no_snapshot_or_route_exists():
 
 def test_generate_edges_is_reproducible_and_cycle_safe():
     first = generate_edges(11)
+    lps = {"LP_A", "LP_B", "LP_C"}
+    expected_quotes = {
+        (source, target, lp)
+        for source in Currency
+        for target in Currency
+        if source != target
+        for lp in lps
+    }
 
     assert first == generate_edges(11)
     assert first != generate_edges(12)
-    assert {edge.lp for edge in first} == {"LP_A", "LP_B", "LP_C"}
+    covered_currencies = {edge.source for edge in first} | {
+        edge.target for edge in first
+    }
+    assert covered_currencies == set(Currency)
+    assert {(edge.source, edge.target, edge.lp) for edge in first} == expected_quotes
+    assert len(first) == len(expected_quotes)
     assert all(edge.rate > 0 for edge in first)
     compute_routes(first, version=11)
 
