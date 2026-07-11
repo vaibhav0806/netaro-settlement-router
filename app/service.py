@@ -11,6 +11,9 @@ from app.routing import RateBook
 from app.schemas import SettlementCreate, SettlementRead, request_fingerprint
 
 
+IDEMPOTENCY_CONSTRAINT = "uq_settlements_owner_idempotency_key"
+
+
 class IdempotencyConflict(Exception):
     pass
 
@@ -244,5 +247,5 @@ class SettlementService:
     def _is_idempotency_violation(error: IntegrityError) -> bool:
         return (
             getattr(error.orig, "sqlstate", None) == "23505"
-            and "settlements_owner_id_idempotency_key_key" in str(error.orig)
+            and f'constraint "{IDEMPOTENCY_CONSTRAINT}"' in str(error.orig)
         )

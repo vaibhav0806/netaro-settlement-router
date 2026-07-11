@@ -2,7 +2,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from app.ledger import reserve
 from app.models import JournalEvent, JournalTransaction, Settlement, SettlementStatus
@@ -16,6 +16,20 @@ from conftest import ScriptedPayoutProvider
 
 def command(amount: str = "40", target: Currency = Currency.PHP) -> SettlementCreate:
     return SettlementCreate(amount_usd=Decimal(amount), target_currency=target)
+
+
+async def test_owner_idempotency_constraint_has_stable_name(
+    clean_database, session_factory
+):
+    async with session_factory() as session:
+        constraint_name = await session.scalar(
+            text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = 'settlements'::regclass AND contype = 'u'"
+            )
+        )
+
+    assert constraint_name == "uq_settlements_owner_idempotency_key"
 
 
 async def insert_reserved(session_factory, rate_book, key: str = "crash") -> Settlement:

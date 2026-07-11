@@ -89,6 +89,7 @@ async def client_factory(seeded_accounts, session_factory, rate_book):
         *,
         rates=rate_book,
         database_check=None,
+        raise_app_exceptions=True,
     ) -> httpx.AsyncClient:
         provider = provider or ScriptedPayoutProvider(ProviderResult.PAID)
         app = create_app(
@@ -101,7 +102,10 @@ async def client_factory(seeded_accounts, session_factory, rate_book):
         await lifespan.__aenter__()
         lifespans.append(lifespan)
         client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
+            transport=httpx.ASGITransport(
+                app=app, raise_app_exceptions=raise_app_exceptions
+            ),
+            base_url="http://test",
         )
         clients.append(client)
         return client
@@ -251,6 +255,22 @@ async def test_insufficient_funds_returns_stable_409(client_factory):
         "/settlements",
         headers={"Idempotency-Key": "api-funds", "X-Owner-ID": "customer"},
         json={"amount_usd": "1001", "target_currency": "PHP"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "insufficient funds"}
+
+
+async def test_largest_accepted_amount_returns_insufficient_funds(client_factory):
+    client = await client_factory(raise_app_exceptions=False)
+
+    response = await client.post(
+        "/settlements",
+        headers={"Idempotency-Key": "api-max-funds", "X-Owner-ID": "customer"},
+        json={
+            "amount_usd": "9999999999999999.99999999",
+            "target_currency": "PHP",
+        },
     )
 
     assert response.status_code == 409

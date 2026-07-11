@@ -79,7 +79,7 @@ def upgrade() -> None:
         sa.Column("route", sa.JSON(), nullable=False),
         sa.Column("snapshot_version", sa.Integer(), nullable=False),
         sa.Column("aggregate_rate", sa.Numeric(24, 8), nullable=False),
-        sa.Column("quoted_amount", sa.Numeric(24, 8), nullable=False),
+        sa.Column("quoted_amount", sa.Numeric(32, 8), nullable=False),
         sa.Column("provider_operation_id", sa.Uuid(), nullable=False),
         sa.Column("status", settlement_status, nullable=False),
         sa.Column(
@@ -102,7 +102,11 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint("quoted_amount > 0", name="ck_settlements_quote_positive"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("owner_id", "idempotency_key"),
+        sa.UniqueConstraint(
+            "owner_id",
+            "idempotency_key",
+            name="uq_settlements_owner_idempotency_key",
+        ),
     )
     op.create_table(
         "journal_transactions",

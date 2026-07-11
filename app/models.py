@@ -85,7 +85,11 @@ class Account(Base):
 class Settlement(Base):
     __tablename__ = "settlements"
     __table_args__ = (
-        UniqueConstraint("owner_id", "idempotency_key"),
+        UniqueConstraint(
+            "owner_id",
+            "idempotency_key",
+            name="uq_settlements_owner_idempotency_key",
+        ),
         CheckConstraint("amount_usd > 0", name="ck_settlements_amount_positive"),
         CheckConstraint("aggregate_rate > 0", name="ck_settlements_rate_positive"),
         CheckConstraint("quoted_amount > 0", name="ck_settlements_quote_positive"),
@@ -104,7 +108,7 @@ class Settlement(Base):
     route: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
     snapshot_version: Mapped[int] = mapped_column(nullable=False)
     aggregate_rate: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
-    quoted_amount: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
+    quoted_amount: Mapped[Decimal] = mapped_column(Numeric(32, 8), nullable=False)
     provider_operation_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     status: Mapped[SettlementStatus] = mapped_column(settlement_status_enum, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

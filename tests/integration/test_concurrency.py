@@ -24,6 +24,23 @@ from conftest import ScriptedPayoutProvider
 COMMAND = SettlementCreate(amount_usd=Decimal("20"), target_currency=Currency.PHP)
 
 
+async def test_scripted_provider_reuses_stored_result_for_replayed_operation():
+    settlement_id = uuid4()
+    provider = ScriptedPayoutProvider(ProviderResult.PAID)
+
+    first = await provider.initiate(
+        settlement_id, Decimal("20"), Currency.PHP, Decimal("1100")
+    )
+    provider.initial_result = ProviderResult.UNPAID
+    replay = await provider.initiate(
+        settlement_id, Decimal("20"), Currency.PHP, Decimal("1100")
+    )
+
+    assert first == replay == ProviderResult.PAID
+    assert provider.initiate_calls == [settlement_id, settlement_id]
+    assert provider.effective_operations == {settlement_id: ProviderResult.PAID}
+
+
 async def test_one_hundred_same_key_calls_create_one_reserve_and_initiation(
     clean_database, session_factory, rate_book
 ):
@@ -181,6 +198,7 @@ async def test_concurrent_not_found_recovery_has_one_effective_operation(
         provider.allow_initiate.set()
     results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=20)
 
-    assert all(result.status == SettlementStatus.SUCCESS for result in results)
-    assert set(provider.initiate_calls) == {settlement_id}
-    assert len(provider.effective_operations) == 1
+    assert all(result == results[0] for result in results)
+    assert results[0].status == SettlementStatus.SUCCESS
+    assert provider.initiate_calls == [settlement_id] * 10
+    assert provider.effective_operations == {settlement_id: ProviderResult.PAID}

@@ -95,7 +95,9 @@ class ScriptedPayoutProvider(PayoutProvider):
         self.lookup_results = deque(lookup_results)
         self.initiate_calls: list[UUID] = []
         self.lookup_calls: list[UUID] = []
-        self.effective_operations: set[UUID] = set()
+        self.effective_operations: dict[
+            UUID, ProviderResult | PayoutTimeout
+        ] = {}
         self.initiate_started = asyncio.Event()
         self.allow_initiate = asyncio.Event()
         if not paused:
@@ -112,13 +114,15 @@ class ScriptedPayoutProvider(PayoutProvider):
     ) -> ProviderResult:
         async with self._initiation_condition:
             self.initiate_calls.append(settlement_id)
-            self.effective_operations.add(settlement_id)
+            outcome = self.effective_operations.setdefault(
+                settlement_id, self.initial_result
+            )
             self.initiate_started.set()
             self._initiation_condition.notify_all()
         await self.allow_initiate.wait()
-        if isinstance(self.initial_result, PayoutTimeout):
-            raise PayoutTimeout(str(self.initial_result))
-        return self.initial_result
+        if isinstance(outcome, PayoutTimeout):
+            raise PayoutTimeout(str(outcome))
+        return outcome
 
     async def lookup(self, settlement_id: UUID) -> ProviderLookup:
         async with self._lock:
