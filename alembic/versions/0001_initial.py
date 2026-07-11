@@ -115,6 +115,11 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        sa.CheckConstraint(
+            "(event = 'OPENING' AND settlement_id IS NULL) OR "
+            "(event <> 'OPENING' AND settlement_id IS NOT NULL)",
+            name="ck_journal_transactions_event_settlement",
+        ),
         sa.ForeignKeyConstraint(["settlement_id"], ["settlements.id"]),
         sa.PrimaryKeyConstraint("id"),
     )

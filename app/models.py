@@ -120,6 +120,13 @@ class Settlement(Base):
 
 class JournalTransaction(Base):
     __tablename__ = "journal_transactions"
+    __table_args__ = (
+        CheckConstraint(
+            "(event = 'OPENING' AND settlement_id IS NULL) OR "
+            "(event <> 'OPENING' AND settlement_id IS NOT NULL)",
+            name="ck_journal_transactions_event_settlement",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     settlement_id: Mapped[UUID | None] = mapped_column(

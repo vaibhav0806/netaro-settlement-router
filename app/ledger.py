@@ -126,13 +126,20 @@ async def release(session: AsyncSession, settlement: Settlement) -> None:
 
 async def assert_ledger_invariants(session: AsyncSession) -> None:
     tracked_accounts = [
-        value for value in session.identity_map.values() if isinstance(value, Account)
+        value
+        for value in (*session.identity_map.values(), *session.new)
+        if isinstance(value, Account)
     ]
     assert all(
-        account.balance >= 0 for account in tracked_accounts
+        account.balance is None or account.balance >= 0
+        for account in tracked_accounts
     ), "negative account balance"
     await session.flush()
-    accounts = (await session.scalars(select(Account))).all()
+    accounts = (
+        await session.scalars(
+            select(Account).order_by(Account.id).with_for_update()
+        )
+    ).all()
     postings = (await session.scalars(select(Posting))).all()
     assert all(account.balance >= 0 for account in accounts), "negative account balance"
     journal_totals: dict[

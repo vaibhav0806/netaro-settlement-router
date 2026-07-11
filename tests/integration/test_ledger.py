@@ -3,7 +3,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,7 @@ from app.ledger import (
 )
 from app.models import (
     Account,
+    AccountClass,
     AccountPurpose,
     JournalEvent,
     JournalTransaction,
@@ -234,4 +235,226 @@ async def test_invariant_check_accepts_valid_uncommitted_postings(
     await reserve(session, settlement)
 
     await assert_ledger_invariants(session)
+    await session.rollback()
+
+
+async def test_opening_journal_rejects_settlement_id(session):
+    settlement = await make_settlement(session, amount=Decimal("40"))
+    session.add(
+        JournalTransaction(
+            settlement_id=settlement.id,
+            event=JournalEvent.OPENING,
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.flush()
+    await session.rollback()
+
+
+async def test_nonopening_journal_requires_settlement_id(session):
+    session.add(
+        JournalTransaction(
+            settlement_id=None,
+            event=JournalEvent.RESERVE,
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.flush()
+    await session.rollback()
+
+
+async def test_invariant_audit_waits_for_concurrent_ledger_commit(
+    session_factory, seeded_accounts
+):
+    writer_locked = asyncio.Event()
+    allow_commit = asyncio.Event()
+    auditor_pid = asyncio.get_running_loop().create_future()
+
+    async def write_reserve() -> None:
+        async with session_factory() as writer:
+            settlement = await make_settlement(
+                writer, amount=Decimal("40"), key="concurrent-audit"
+            )
+            await reserve(writer, settlement)
+            await writer.flush()
+            writer_locked.set()
+            await allow_commit.wait()
+            await writer.commit()
+
+    async def audit() -> None:
+        async with session_factory() as auditor:
+            isolation = await auditor.scalar(text("SHOW transaction_isolation"))
+            assert isolation == "read committed"
+            auditor_pid.set_result(
+                await auditor.scalar(text("SELECT pg_backend_pid()"))
+            )
+            await assert_ledger_invariants(auditor)
+            await auditor.rollback()
+
+    writer_task = asyncio.create_task(write_reserve())
+    ready_task = asyncio.create_task(writer_locked.wait())
+    audit_task = None
+    try:
+        done, _ = await asyncio.wait(
+            (writer_task, ready_task),
+            timeout=1,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if writer_task in done:
+            await writer_task
+        if ready_task not in done:
+            raise TimeoutError("writer did not acquire account locks")
+        audit_task = asyncio.create_task(audit())
+        pid = await asyncio.wait_for(auditor_pid, timeout=1)
+        async with session_factory() as observer:
+            async with asyncio.timeout(2):
+                while True:
+                    wait_event_type = await observer.scalar(
+                        text(
+                            "SELECT wait_event_type FROM pg_stat_activity "
+                            "WHERE pid = :pid"
+                        ),
+                        {"pid": pid},
+                    )
+                    if wait_event_type == "Lock":
+                        break
+                    if audit_task.done():
+                        await audit_task
+                        pytest.fail("audit completed without waiting for account locks")
+                    await asyncio.sleep(0.01)
+
+        allow_commit.set()
+        await asyncio.wait_for(writer_task, timeout=1)
+        await asyncio.wait_for(audit_task, timeout=1)
+    finally:
+        allow_commit.set()
+        tasks = [
+            task
+            for task in (writer_task, ready_task, audit_task)
+            if task is not None
+        ]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_seed_rejects_missing_omnibus_account(session):
+    await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.commit()
+    await session.execute(
+        delete(Account).where(
+            Account.owner_id == "system",
+            Account.currency == Currency.USDC,
+            Account.purpose == AccountPurpose.OMNIBUS,
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
+        await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.rollback()
+
+
+async def test_seed_rejects_missing_opening_effect(session):
+    await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.commit()
+    opening_id = await session.scalar(
+        select(JournalTransaction.id).where(
+            JournalTransaction.event == JournalEvent.OPENING
+        )
+    )
+    await session.execute(delete(Posting).where(Posting.journal_id == opening_id))
+    await session.execute(
+        delete(JournalTransaction).where(JournalTransaction.id == opening_id)
+    )
+    await session.commit()
+
+    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
+        await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.rollback()
+
+
+async def test_seed_rejects_corrupt_opening_effect(session):
+    await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.commit()
+    opening_id = await session.scalar(
+        select(JournalTransaction.id).where(
+            JournalTransaction.event == JournalEvent.OPENING
+        )
+    )
+    await session.execute(
+        update(Posting)
+        .where(
+            Posting.journal_id == opening_id,
+            Posting.side == "CREDIT",
+        )
+        .values(amount=Decimal("999"))
+    )
+    await session.commit()
+
+    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
+        await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.rollback()
+
+
+async def test_seed_rejects_duplicate_opening_journal(session):
+    await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.commit()
+    session.add(
+        JournalTransaction(settlement_id=None, event=JournalEvent.OPENING)
+    )
+    await session.commit()
+
+    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
+        await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.rollback()
+
+
+async def test_seed_rejects_partial_system_accounts(session):
+    session.add(
+        Account(
+            owner_id="system",
+            currency=Currency.USD,
+            account_class=AccountClass.ASSET,
+            purpose=AccountPurpose.OMNIBUS,
+            balance=Decimal("0"),
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
+        await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.rollback()
+
+
+async def test_invariant_check_accepts_pending_account_default_balance(session):
+    session.add(
+        Account(
+            owner_id="pending-default",
+            currency=Currency.USD,
+            account_class=AccountClass.LIABILITY,
+            purpose=AccountPurpose.AVAILABLE,
+        )
+    )
+
+    await assert_ledger_invariants(session)
+    await session.rollback()
+
+
+async def test_invariant_check_reports_negative_pending_new_account(session):
+    session.add(
+        Account(
+            owner_id="pending",
+            currency=Currency.USD,
+            account_class=AccountClass.LIABILITY,
+            purpose=AccountPurpose.AVAILABLE,
+            balance=Decimal("-1"),
+        )
+    )
+
+    with pytest.raises(AssertionError, match="negative account balance"):
+        await assert_ledger_invariants(session)
     await session.rollback()
