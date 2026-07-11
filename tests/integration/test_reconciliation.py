@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from uuid import uuid4
 
@@ -22,6 +23,16 @@ from conftest import ScriptedPayoutProvider
 
 
 COMMAND = SettlementCreate(amount_usd=Decimal("40"), target_currency=Currency.PHP)
+
+
+class LookupFailureProvider:
+    async def initiate(
+        self, settlement_id, amount_usd, target_currency, quoted_amount
+    ):
+        raise AssertionError("initiate must not be called")
+
+    async def lookup(self, settlement_id):
+        raise RuntimeError("provider lookup failed")
 
 
 async def insert_in_progress(session_factory, rate_book) -> Settlement:
@@ -88,6 +99,120 @@ async def test_unknown_reconciliation_preserves_pending_reservation(
             )
         )
     assert reserved == Decimal("40")
+
+
+async def test_repeated_unknown_reconciliation_is_a_noop(
+    clean_database, session_factory, rate_book
+):
+    async with session_factory() as session:
+        await seed_demo_accounts(session, "customer", Decimal("100"))
+        await session.commit()
+    provider = ScriptedPayoutProvider(
+        PayoutTimeout(), tuple([ProviderLookup.UNKNOWN] * 3)
+    )
+    service, pending = await create_pending(session_factory, rate_book, provider)
+
+    for _ in range(3):
+        result = await service.reconcile(pending.id)
+        assert result.status == SettlementStatus.PENDING_RECONCILIATION
+        async with session_factory() as session:
+            balances = dict(
+                (
+                    await session.execute(
+                        select(Account.purpose, Account.balance).where(
+                            Account.owner_id == "customer"
+                        )
+                    )
+                ).all()
+            )
+            events = (
+                await session.scalars(
+                    select(JournalTransaction.event).where(
+                        JournalTransaction.settlement_id == pending.id
+                    )
+                )
+            ).all()
+        assert balances[AccountPurpose.AVAILABLE] == Decimal("60")
+        assert balances[AccountPurpose.RESERVED] == Decimal("40")
+        assert events == [JournalEvent.RESERVE]
+
+
+async def test_concurrent_unpaid_reconciliation_releases_once(
+    clean_database, session_factory, rate_book
+):
+    async with session_factory() as session:
+        await seed_demo_accounts(session, "customer", Decimal("100"))
+        await session.commit()
+    provider = ScriptedPayoutProvider(
+        PayoutTimeout(), tuple([ProviderLookup.UNPAID] * 50)
+    )
+    service, pending = await create_pending(session_factory, rate_book, provider)
+
+    results = await asyncio.gather(
+        *(service.reconcile(pending.id) for _ in range(50))
+    )
+
+    assert all(result.status == SettlementStatus.FAILED for result in results)
+    async with session_factory() as session:
+        balances = dict(
+            (
+                await session.execute(
+                    select(Account.purpose, Account.balance).where(
+                        Account.owner_id == "customer"
+                    )
+                )
+            ).all()
+        )
+        events = (
+            await session.scalars(
+                select(JournalTransaction.event).where(
+                    JournalTransaction.settlement_id == pending.id
+                )
+            )
+        ).all()
+    assert balances[AccountPurpose.AVAILABLE] == Decimal("100")
+    assert balances[AccountPurpose.RESERVED] == Decimal("0")
+    assert events.count(JournalEvent.RESERVE) == 1
+    assert events.count(JournalEvent.RELEASE) == 1
+    assert events.count(JournalEvent.CONSUME) == 0
+
+
+async def test_unexpected_lookup_failure_preserves_pending_reservation(
+    clean_database, session_factory, rate_book
+):
+    async with session_factory() as session:
+        await seed_demo_accounts(session, "customer", Decimal("100"))
+        await session.commit()
+    _, pending = await create_pending(
+        session_factory, rate_book, ScriptedPayoutProvider(PayoutTimeout())
+    )
+    service = SettlementService(session_factory, rate_book, LookupFailureProvider())
+
+    with pytest.raises(RuntimeError, match="provider lookup failed"):
+        await service.reconcile(pending.id)
+
+    persisted = await service.get(pending.id)
+    assert persisted.status == SettlementStatus.PENDING_RECONCILIATION
+    async with session_factory() as session:
+        balances = dict(
+            (
+                await session.execute(
+                    select(Account.purpose, Account.balance).where(
+                        Account.owner_id == "customer"
+                    )
+                )
+            ).all()
+        )
+        events = (
+            await session.scalars(
+                select(JournalTransaction.event).where(
+                    JournalTransaction.settlement_id == pending.id
+                )
+            )
+        ).all()
+    assert balances[AccountPurpose.AVAILABLE] == Decimal("60")
+    assert balances[AccountPurpose.RESERVED] == Decimal("40")
+    assert events == [JournalEvent.RESERVE]
 
 
 @pytest.mark.parametrize(

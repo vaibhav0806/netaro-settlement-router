@@ -5,7 +5,14 @@ import pytest
 
 from sqlalchemy import func, select
 
-from app.models import Account, AccountPurpose, JournalEvent, JournalTransaction
+from app.models import (
+    Account,
+    AccountPurpose,
+    JournalEvent,
+    JournalTransaction,
+    Settlement,
+    SettlementStatus,
+)
 from app.provider import (
     MockPayoutProvider,
     PayoutTimeout,
@@ -17,6 +24,16 @@ from app.schemas import SettlementCreate
 from app.seed import seed_demo_accounts
 from app.service import SettlementService
 from conftest import ScriptedPayoutProvider
+
+
+class InitiationFailureProvider:
+    async def initiate(
+        self, settlement_id, amount_usd, target_currency, quoted_amount
+    ):
+        raise RuntimeError("provider initiation failed")
+
+    async def lookup(self, settlement_id):
+        return ProviderLookup.UNKNOWN
 
 
 async def test_paid_settlement_consumes_reservation_once(
@@ -140,6 +157,53 @@ async def test_timeout_preserves_reservation_for_reconciliation(
     assert balances[AccountPurpose.AVAILABLE] == Decimal("60")
     assert balances[AccountPurpose.RESERVED] == Decimal("40")
     assert events == {JournalEvent.RESERVE}
+
+
+async def test_unexpected_initiation_failure_preserves_in_progress_reservation(
+    clean_database, session_factory, rate_book
+):
+    async with session_factory() as session:
+        await seed_demo_accounts(session, "customer", Decimal("100"))
+        await session.commit()
+    service = SettlementService(
+        session_factory, rate_book, InitiationFailureProvider()
+    )
+
+    with pytest.raises(RuntimeError, match="provider initiation failed"):
+        await service.create(
+            "customer",
+            "runtime-failure",
+            SettlementCreate(
+                amount_usd=Decimal("40"), target_currency=Currency.PHP
+            ),
+        )
+
+    async with session_factory() as session:
+        settlement = await session.scalar(
+            select(Settlement).where(
+                Settlement.idempotency_key == "runtime-failure"
+            )
+        )
+        balances = dict(
+            (
+                await session.execute(
+                    select(Account.purpose, Account.balance).where(
+                        Account.owner_id == "customer"
+                    )
+                )
+            ).all()
+        )
+        events = (
+            await session.scalars(
+                select(JournalTransaction.event).where(
+                    JournalTransaction.settlement_id == settlement.id
+                )
+            )
+        ).all()
+    assert settlement.status == SettlementStatus.PAYOUT_IN_PROGRESS
+    assert balances[AccountPurpose.AVAILABLE] == Decimal("60")
+    assert balances[AccountPurpose.RESERVED] == Decimal("40")
+    assert events == [JournalEvent.RESERVE]
 
 
 async def test_mock_provider_deduplicates_timeout_operation_by_settlement_id():

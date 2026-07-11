@@ -39,6 +39,18 @@ def test_profitable_cycle_invalidates_snapshot():
         compute_routes(edges, version=1)
 
 
+def test_disconnected_profitable_cycle_does_not_break_reachable_quote():
+    edges = (
+        Edge(Currency.USD, Currency.PHP, "php", Decimal("55")),
+        Edge(Currency.EUR, Currency.AED, "aed", Decimal("4")),
+        Edge(Currency.AED, Currency.EUR, "eur", Decimal("0.3")),
+    )
+
+    assert compute_routes(edges, version=1)[Currency.PHP].aggregate_rate == Decimal(
+        "55"
+    )
+
+
 def test_selects_best_parallel_lp_edge():
     edges = (
         Edge(Currency.USD, Currency.PHP, "LP_A", Decimal("54")),
@@ -109,6 +121,68 @@ def test_rate_book_publishes_and_quotes_one_complete_snapshot():
     assert quote.hops[0] == RouteHop(
         Currency.USD, Currency.PHP, "LP_A", Decimal("55")
     )
+
+
+def test_invalid_publication_preserves_last_valid_snapshot():
+    book = RateBook()
+    book.publish(
+        (Edge(Currency.USD, Currency.PHP, "LP_A", Decimal("55")),),
+        version=1,
+    )
+    original = book.quote(Currency.PHP)
+
+    with pytest.raises(InvalidRateGraph):
+        book.publish(
+            (
+                Edge(Currency.USD, Currency.PHP, "LP_B", Decimal("56")),
+                Edge(Currency.USD, Currency.EUR, "LP_A", Decimal("0.9")),
+                Edge(Currency.EUR, Currency.USD, "LP_A", Decimal("1.2")),
+            ),
+            version=2,
+        )
+
+    assert book.quote(Currency.PHP) == original
+
+
+@pytest.mark.asyncio
+async def test_concurrent_readers_only_observe_complete_versions():
+    book = RateBook()
+    versions = {
+        1: (Edge(Currency.USD, Currency.PHP, "direct", Decimal("55")),),
+        2: (
+            Edge(Currency.USD, Currency.EUR, "eur", Decimal("0.9")),
+            Edge(Currency.EUR, Currency.PHP, "php", Decimal("62")),
+        ),
+    }
+    book.publish(versions[1], version=1)
+    expected = {
+        (
+            version,
+            quote.hops,
+            quote.aggregate_rate,
+        )
+        for version, edges in versions.items()
+        for quote in (compute_routes(edges, version)[Currency.PHP],)
+    }
+    observed = set()
+
+    async def publish() -> None:
+        for index in range(200):
+            version = index % 2 + 1
+            book.publish(versions[version], version)
+            await asyncio.sleep(0)
+
+    async def read() -> None:
+        for _ in range(400):
+            quote = book.quote(Currency.PHP)
+            observed.add(
+                (quote.snapshot_version, quote.hops, quote.aggregate_rate)
+            )
+            await asyncio.sleep(0)
+
+    await asyncio.gather(publish(), *(read() for _ in range(20)))
+
+    assert observed == expected
 
 
 def test_published_snapshot_routes_cannot_be_mutated():

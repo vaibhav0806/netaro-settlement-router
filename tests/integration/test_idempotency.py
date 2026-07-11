@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from uuid import uuid4
 
@@ -30,6 +31,102 @@ async def test_owner_idempotency_constraint_has_stable_name(
         )
 
     assert constraint_name == "uq_settlements_owner_idempotency_key"
+
+
+async def test_same_key_is_scoped_to_owner(
+    clean_database, session_factory, rate_book
+):
+    requested = command()
+    quote = rate_book.quote(requested.target_currency)
+    settlements = []
+    for owner_id in ("owner-a", "owner-b"):
+        settlement_id = uuid4()
+        settlements.append(
+            Settlement(
+                id=settlement_id,
+                owner_id=owner_id,
+                idempotency_key="shared-key",
+                request_fingerprint=request_fingerprint(owner_id, requested),
+                amount_usd=requested.amount_usd,
+                target_currency=requested.target_currency,
+                route=[],
+                snapshot_version=quote.snapshot_version,
+                aggregate_rate=quote.aggregate_rate,
+                quoted_amount=requested.amount_usd * quote.aggregate_rate,
+                provider_operation_id=settlement_id,
+                status=SettlementStatus.RESERVED,
+            )
+        )
+
+    async with session_factory() as session:
+        session.add_all(settlements)
+        await session.commit()
+        persisted = (
+            await session.scalars(
+                select(Settlement).where(
+                    Settlement.idempotency_key == "shared-key"
+                )
+            )
+        ).all()
+
+    assert {settlement.owner_id for settlement in persisted} == {
+        "owner-a",
+        "owner-b",
+    }
+    assert len({settlement.id for settlement in persisted}) == 2
+
+
+async def test_concurrent_conflicting_payloads_have_one_winner(
+    clean_database, session_factory, rate_book
+):
+    async with session_factory() as session:
+        await seed_demo_accounts(session, "customer", Decimal("100"))
+        await session.commit()
+    provider = ScriptedPayoutProvider(ProviderResult.PAID)
+    service = SettlementService(session_factory, rate_book, provider)
+    requests = [command("40")] * 20 + [command("41")] * 20
+
+    results = await asyncio.gather(
+        *(service.create("customer", "contested", request) for request in requests),
+        return_exceptions=True,
+    )
+
+    winners = [result for result in results if not isinstance(result, BaseException)]
+    conflicts = [result for result in results if isinstance(result, BaseException)]
+    assert len(winners) == len(conflicts) == 20
+    assert len({winner.id for winner in winners}) == 1
+    assert all(isinstance(error, IdempotencyConflict) for error in conflicts)
+    winner = winners[0]
+    assert all(
+        request.amount_usd == winner.amount_usd
+        for request, result in zip(requests, results)
+        if not isinstance(result, BaseException)
+    )
+    assert all(
+        request.amount_usd != winner.amount_usd
+        for request, result in zip(requests, results)
+        if isinstance(result, BaseException)
+    )
+    async with session_factory() as session:
+        persisted = (
+            await session.scalars(
+                select(Settlement).where(
+                    Settlement.owner_id == "customer",
+                    Settlement.idempotency_key == "contested",
+                )
+            )
+        ).all()
+        reserve_count = await session.scalar(
+            select(func.count())
+            .select_from(JournalTransaction)
+            .where(JournalTransaction.event == JournalEvent.RESERVE)
+        )
+    assert len(persisted) == 1
+    assert persisted[0].request_fingerprint == request_fingerprint(
+        "customer", command(str(winner.amount_usd))
+    )
+    assert reserve_count == 1
+    assert provider.initiate_calls == [winner.id]
 
 
 async def insert_reserved(session_factory, rate_book, key: str = "crash") -> Settlement:

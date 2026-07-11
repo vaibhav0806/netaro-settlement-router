@@ -21,6 +21,7 @@ from app.models import (
     JournalEvent,
     JournalTransaction,
     Posting,
+    PostingSide,
     Settlement,
     SettlementStatus,
 )
@@ -178,6 +179,75 @@ async def test_every_journal_balances_per_currency(seeded_accounts, session):
     )
     with pytest.raises(AssertionError, match="unbalanced journal currency"):
         await assert_ledger_invariants(session)
+    await session.rollback()
+
+
+async def test_invariant_check_reports_positive_materialized_balance_mismatch(
+    seeded_accounts, session
+):
+    account = await session.scalar(
+        select(Account).where(
+            Account.owner_id == "customer",
+            Account.purpose == AccountPurpose.AVAILABLE,
+        )
+    )
+    account.balance = Decimal("999")
+
+    with pytest.raises(AssertionError, match="materialized account balance mismatch"):
+        await assert_ledger_invariants(session)
+    await session.rollback()
+
+
+async def test_application_generated_journals_have_two_balanced_positive_postings(
+    seeded_accounts, session
+):
+    consumed = await make_settlement(session, Decimal("40"), "consumed")
+    await reserve(session, consumed)
+    await consume(session, consumed)
+    released = await make_settlement(session, Decimal("30"), "released")
+    await reserve(session, released)
+    await release(session, released)
+    await session.commit()
+
+    journals = (await session.scalars(select(JournalTransaction))).all()
+    assert {journal.event for journal in journals} == set(JournalEvent)
+    for journal in journals:
+        postings = (
+            await session.scalars(
+                select(Posting).where(Posting.journal_id == journal.id)
+            )
+        ).all()
+        assert len(postings) == 2
+        assert all(posting.amount > 0 for posting in postings)
+        assert len({posting.currency for posting in postings}) == 1
+        assert {posting.side for posting in postings} == {
+            PostingSide.DEBIT,
+            PostingSide.CREDIT,
+        }
+
+
+@pytest.mark.parametrize("amount", [Decimal("0"), Decimal("-1")])
+async def test_postgresql_rejects_nonpositive_posting_amount(
+    seeded_accounts, session, amount
+):
+    journal = await session.scalar(
+        select(JournalTransaction).where(
+            JournalTransaction.event == JournalEvent.OPENING
+        )
+    )
+    account = await session.scalar(select(Account).limit(1))
+    session.add(
+        Posting(
+            journal_id=journal.id,
+            account_id=account.id,
+            currency=account.currency,
+            side=PostingSide.DEBIT,
+            amount=amount,
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.flush()
     await session.rollback()
 
 
