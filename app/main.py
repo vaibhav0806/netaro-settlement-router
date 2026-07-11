@@ -23,7 +23,7 @@ def _provider_from_environment() -> PayoutProvider:
     mode = os.getenv("PAYOUT_MODE", "random")
     if mode not in {"random", "load"}:
         raise RuntimeError(f"unsupported PAYOUT_MODE: {mode}")
-    return MockPayoutProvider()
+    return MockPayoutProvider(load_mode=mode == "load")
 
 
 def create_app(
