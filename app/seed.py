@@ -6,7 +6,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import SessionFactory
-from app.ledger import apply_posting
+from app.ledger import apply_posting, assert_ledger_invariants
 from app.models import (
     Account,
     AccountClass,
@@ -69,15 +69,15 @@ async def _validate_existing_seed(
     reserved = accounts[(owner_id, Currency.USD, AccountPurpose.RESERVED)]
     omnibus_usd = accounts[("system", Currency.USD, AccountPurpose.OMNIBUS)]
     omnibus_usdc = accounts[("system", Currency.USDC, AccountPurpose.OMNIBUS)]
-    expected_accounts = (
-        (available, AccountClass.LIABILITY, amount),
-        (reserved, AccountClass.LIABILITY, Decimal("0")),
-        (omnibus_usd, AccountClass.ASSET, amount),
-        (omnibus_usdc, AccountClass.ASSET, Decimal("0")),
+    expected_classes = (
+        (available, AccountClass.LIABILITY),
+        (reserved, AccountClass.LIABILITY),
+        (omnibus_usd, AccountClass.ASSET),
+        (omnibus_usdc, AccountClass.ASSET),
     )
     if any(
-        account.account_class != account_class or account.balance != balance
-        for account, account_class, balance in expected_accounts
+        account.account_class != account_class
+        for account, account_class in expected_classes
     ):
         raise RuntimeError("seed state is inconsistent")
 
@@ -108,6 +108,10 @@ async def _validate_existing_seed(
     )
     if actual != expected:
         raise RuntimeError("seed state is inconsistent")
+    try:
+        await assert_ledger_invariants(session)
+    except AssertionError:
+        raise RuntimeError("seed state is inconsistent") from None
 
 
 async def seed_demo_accounts(

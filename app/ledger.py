@@ -137,10 +137,17 @@ async def assert_ledger_invariants(session: AsyncSession) -> None:
     await session.flush()
     accounts = (
         await session.scalars(
-            select(Account).order_by(Account.id).with_for_update()
+            select(Account)
+            .order_by(Account.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).all()
-    postings = (await session.scalars(select(Posting))).all()
+    postings = (
+        await session.scalars(
+            select(Posting).execution_options(populate_existing=True)
+        )
+    ).all()
     assert all(account.balance >= 0 for account in accounts), "negative account balance"
     journal_totals: dict[
         tuple[object, Currency], dict[PostingSide, Decimal]

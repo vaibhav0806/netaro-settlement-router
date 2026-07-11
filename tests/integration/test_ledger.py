@@ -287,10 +287,29 @@ async def test_invariant_audit_waits_for_concurrent_ledger_commit(
         async with session_factory() as auditor:
             isolation = await auditor.scalar(text("SHOW transaction_isolation"))
             assert isolation == "read committed"
+            preloaded = (
+                await auditor.scalars(select(Account).order_by(Account.id))
+            ).all()
+            available = next(
+                account
+                for account in preloaded
+                if account.owner_id == "customer"
+                and account.purpose == AccountPurpose.AVAILABLE
+            )
+            reserved = next(
+                account
+                for account in preloaded
+                if account.owner_id == "customer"
+                and account.purpose == AccountPurpose.RESERVED
+            )
+            assert available.balance == Decimal("1000")
+            assert reserved.balance == Decimal("0")
             auditor_pid.set_result(
                 await auditor.scalar(text("SELECT pg_backend_pid()"))
             )
             await assert_ledger_invariants(auditor)
+            assert available.balance == Decimal("960")
+            assert reserved.balance == Decimal("40")
             await auditor.rollback()
 
     writer_task = asyncio.create_task(write_reserve())
@@ -441,6 +460,66 @@ async def test_invariant_check_accepts_pending_account_default_balance(session):
     )
 
     await assert_ledger_invariants(session)
+    await session.rollback()
+
+
+@pytest.mark.parametrize("terminal_event", [None, "consume", "release"])
+async def test_seed_is_noop_after_valid_ledger_evolution(session, terminal_event):
+    await seed_demo_accounts(session, "customer", Decimal("1000"))
+    settlement = await make_settlement(
+        session, amount=Decimal("40"), key=f"seed-replay-{terminal_event}"
+    )
+    await reserve(session, settlement)
+    if terminal_event == "consume":
+        await consume(session, settlement)
+    elif terminal_event == "release":
+        await release(session, settlement)
+    await session.commit()
+
+    before_balances = dict(
+        (
+            await session.execute(
+                select(Account.id, Account.balance).order_by(Account.id)
+            )
+        ).all()
+    )
+    before_journals = await session.scalar(
+        select(func.count()).select_from(JournalTransaction)
+    )
+    before_postings = await session.scalar(select(func.count()).select_from(Posting))
+
+    await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.commit()
+
+    assert dict(
+        (
+            await session.execute(
+                select(Account.id, Account.balance).order_by(Account.id)
+            )
+        ).all()
+    ) == before_balances
+    assert (
+        await session.scalar(select(func.count()).select_from(JournalTransaction))
+        == before_journals
+    )
+    assert await session.scalar(select(func.count()).select_from(Posting)) == before_postings
+
+
+async def test_seed_rejects_corrupt_current_balance(session):
+    await seed_demo_accounts(session, "customer", Decimal("1000"))
+    await session.commit()
+    await session.execute(
+        update(Account)
+        .where(
+            Account.owner_id == "customer",
+            Account.purpose == AccountPurpose.AVAILABLE,
+        )
+        .values(balance=Decimal("999"))
+    )
+    await session.commit()
+
+    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
+        await seed_demo_accounts(session, "customer", Decimal("1000"))
     await session.rollback()
 
 
