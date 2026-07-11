@@ -68,6 +68,29 @@ DATABASE_URL=postgresql+asyncpg://netaro:netaro@localhost:55432/netaro \
 Port `55432` keeps this project stack isolated from any PostgreSQL already on
 the default host port. Override `POSTGRES_HOST_PORT` consistently if needed.
 
+## Isolated Docker end-to-end tests
+
+Each scenario builds the application, selects unused host ports, starts a
+fresh Compose project and volume, captures redacted evidence under
+`.artifacts/e2e/`, and always tears the project down:
+
+```bash
+for scenario in \
+  boot-contract \
+  settlement-idempotency \
+  provider-reconciliation \
+  concurrency-funds \
+  lifecycle-recovery
+do
+  .venv/bin/python tests/e2e/run.py --scenario "$scenario" || exit $?
+done
+```
+
+The lifecycle scenario restarts the API, verifies terminal and ambiguous
+settlements survive, confirms an ambiguous payout is not retried, and checks
+that `/health` changes from `503` during a database outage back to `200` after
+recovery. Concurrency scenarios also run read-only ledger invariant queries.
+
 ## Exact 1,000-request proof
 
 The load proof is destructive to this project's Compose volume. It requires a

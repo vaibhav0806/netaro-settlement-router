@@ -73,6 +73,7 @@ ARTIFACT_NAMES = (
     "scenario.stderr",
     "api.log",
     "db.log",
+    "internal-audit.txt",
     "teardown.txt",
 )
 PORT_COLLISION_PATTERNS = (
@@ -303,6 +304,123 @@ def _scenario_command(spec: ScenarioSpec) -> list[str]:
     return command
 
 
+def _internal_audit(config: RunConfig) -> subprocess.CompletedProcess[str]:
+    sql = """
+BEGIN TRANSACTION READ ONLY;
+SELECT 'negative_accounts=' || count(*) FROM accounts WHERE balance < 0;
+SELECT 'unbalanced_groups=' || count(*) FROM (
+  SELECT journal_id, currency FROM postings GROUP BY journal_id, currency
+  HAVING coalesce(sum(amount) FILTER (WHERE side = 'DEBIT'), 0)
+      <> coalesce(sum(amount) FILTER (WHERE side = 'CREDIT'), 0)
+) invalid;
+SELECT 'duplicate_owner_keys=' || count(*) FROM (
+  SELECT owner_id, idempotency_key FROM settlements
+  GROUP BY owner_id, idempotency_key HAVING count(*) > 1
+) duplicate_rows;
+SELECT 'duplicate_events=' || count(*) FROM (
+  SELECT settlement_id, event FROM journal_transactions
+  WHERE settlement_id IS NOT NULL GROUP BY settlement_id, event
+  HAVING count(*) > 1
+) duplicate_rows;
+COMMIT;
+"""
+    return _run(
+        compose_command(
+            config,
+            "exec",
+            "-T",
+            "db",
+            "psql",
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-At",
+            "-U",
+            "netaro",
+            "-d",
+            "netaro",
+            "-c",
+            sql,
+        ),
+        env=_environment(config),
+    )
+
+
+def _verify_lifecycle(config: RunConfig) -> subprocess.CompletedProcess[str]:
+    settlement_ids = (
+        config.artifact_dir / "lifecycle-settlement-id.txt"
+    ).read_text().splitlines()
+    pending_id = settlement_ids[1]
+    outputs: list[str] = []
+    restart = _run(
+        compose_command(config, "restart", "api"), env=_environment(config)
+    )
+    outputs.append(restart.stdout + restart.stderr)
+    if restart.returncode:
+        return subprocess.CompletedProcess([], restart.returncode, "".join(outputs), restart.stderr)
+    try:
+        wait_for_health(config)
+    except TimeoutError as error:
+        return subprocess.CompletedProcess([], 1, "".join(outputs), str(error))
+
+    for settlement_id in settlement_ids:
+        status, body = _default_health_request(
+            f"http://127.0.0.1:{config.api_host_port}/settlements/{settlement_id}"
+        )
+        outputs.append(f"post_restart_get={status} {body}\n")
+        if status != 200:
+            return subprocess.CompletedProcess([], 1, "".join(outputs), "persistence check failed")
+
+    status, body = _default_health_request(
+        f"http://127.0.0.1:{config.api_host_port}/settlements/{pending_id}/reconcile"
+    )
+    if status == 405:
+        reconcile = _run(
+            [
+                sys.executable,
+                "-c",
+                "import httpx,sys; r=httpx.post(sys.argv[1],timeout=10); "
+                "print(r.status_code, r.text); raise SystemExit(r.status_code != 200)",
+                f"http://127.0.0.1:{config.api_host_port}/settlements/{pending_id}/reconcile",
+            ]
+        )
+        outputs.append(reconcile.stdout + reconcile.stderr)
+        if reconcile.returncode or "PENDING_RECONCILIATION" not in reconcile.stdout:
+            return subprocess.CompletedProcess([], 1, "".join(outputs), "pending recovery changed state")
+
+    stop = _run(
+        compose_command(config, "stop", "db"), env=_environment(config)
+    )
+    outputs.append(stop.stdout + stop.stderr)
+    if stop.returncode:
+        return subprocess.CompletedProcess([], stop.returncode, "".join(outputs), stop.stderr)
+
+    deadline = time.monotonic() + 10
+    health_status = 0
+    health_body: object = {}
+    while time.monotonic() < deadline:
+        health_status, health_body = _default_health_request(
+            f"http://127.0.0.1:{config.api_host_port}/health"
+        )
+        if health_status == 503:
+            break
+        time.sleep(0.25)
+    outputs.append(f"database_down_health={health_status} {health_body}\n")
+    if health_status != 503:
+        return subprocess.CompletedProcess([], 1, "".join(outputs), "expected health 503")
+
+    start = _run(compose_command(config, "start", "db"), env=_environment(config))
+    outputs.append(start.stdout + start.stderr)
+    if start.returncode:
+        return subprocess.CompletedProcess([], start.returncode, "".join(outputs), start.stderr)
+    try:
+        wait_for_health(config)
+    except TimeoutError as error:
+        return subprocess.CompletedProcess([], 1, "".join(outputs), str(error))
+    outputs.append(f"database_recovered_health=200\n")
+    return subprocess.CompletedProcess([], 0, "".join(outputs), "")
+
+
 def run_scenario(spec: ScenarioSpec, *, config: RunConfig | None = None) -> int:
     active_config = config or _new_config(spec)
     started_at = datetime.now(UTC)
@@ -369,6 +487,35 @@ def run_scenario(spec: ScenarioSpec, *, config: RunConfig | None = None) -> int:
                 scenario = _run(
                     _scenario_command(spec), env=scenario_environment
                 )
+                if scenario.returncode == 0 and spec.name == "lifecycle-recovery":
+                    lifecycle = _verify_lifecycle(active_config)
+                    scenario = subprocess.CompletedProcess(
+                        scenario.args,
+                        lifecycle.returncode,
+                        scenario.stdout + lifecycle.stdout,
+                        scenario.stderr + lifecycle.stderr,
+                    )
+                if scenario.returncode == 0 and spec.needs_internal_audit:
+                    audit = _internal_audit(active_config)
+                    audit_text = audit.stdout + audit.stderr
+                    _persist(
+                        active_config.artifact_dir / "internal-audit.txt",
+                        audit_text,
+                    )
+                    expected = {
+                        "negative_accounts=0",
+                        "unbalanced_groups=0",
+                        "duplicate_owner_keys=0",
+                        "duplicate_events=0",
+                    }
+                    observed = set(audit.stdout.splitlines())
+                    if audit.returncode or not expected <= observed:
+                        scenario = subprocess.CompletedProcess(
+                            scenario.args,
+                            audit.returncode or 1,
+                            scenario.stdout,
+                            scenario.stderr + audit_text,
+                        )
                 _persist(
                     active_config.artifact_dir / "scenario.stdout",
                     scenario.stdout,
