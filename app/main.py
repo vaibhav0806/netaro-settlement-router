@@ -49,7 +49,12 @@ def create_app(
         finally:
             await rates.stop()
 
-    application = FastAPI(lifespan=lifespan)
+    application = FastAPI(
+        lifespan=lifespan,
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
+    )
 
     def get_service() -> SettlementService:
         return service

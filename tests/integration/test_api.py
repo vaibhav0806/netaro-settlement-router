@@ -5,12 +5,78 @@ from uuid import uuid4
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.db import DatabaseUnavailable, check_database
 from app.provider import PayoutTimeout, ProviderLookup, ProviderResult
 from app.routing import Currency, Edge, RateBook
 from app.main import create_app
 from conftest import ScriptedPayoutProvider
+
+
+async def test_app_exposes_only_approved_routes(session_factory):
+    app = create_app(
+        sessions=session_factory,
+        provider=ScriptedPayoutProvider(ProviderResult.PAID),
+    )
+
+    routes = {
+        (method, route.path)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+
+    assert routes == {
+        ("POST", "/settlements"),
+        ("GET", "/settlements/{settlement_id}"),
+        ("POST", "/settlements/{settlement_id}/reconcile"),
+        ("GET", "/health"),
+    }
+
+
+async def test_check_database_wraps_sqlalchemy_failure_and_closes_session():
+    class FailingSession:
+        def __init__(self) -> None:
+            self.entered = False
+            self.executed = False
+            self.exited = False
+            self.closed = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return self
+
+        async def __aexit__(self, exception_type, exception, traceback):
+            self.exited = True
+            await self.close()
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def execute(self, statement):
+            self.executed = True
+            raise SQLAlchemyError("database down")
+
+    class FailingSessionFactory:
+        def __init__(self) -> None:
+            self.called = False
+            self.session = FailingSession()
+
+        def __call__(self):
+            self.called = True
+            return self.session
+
+    sessions = FailingSessionFactory()
+
+    with pytest.raises(DatabaseUnavailable) as captured:
+        await check_database(sessions)
+
+    assert isinstance(captured.value.__cause__, SQLAlchemyError)
+    assert sessions.called
+    assert sessions.session.entered
+    assert sessions.session.executed
+    assert sessions.session.exited
+    assert sessions.session.closed
 
 
 @pytest_asyncio.fixture
