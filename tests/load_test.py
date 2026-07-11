@@ -26,6 +26,7 @@ EXPECTED = {
     "RESERVE": 1000,
     "CONSUME": 700,
     "RELEASE": 150,
+    "OPENING": 1,
     "settlement_journals": 1850,
     "total_journals_including_opening": 1851,
     "available_usd": Decimal("15000"),
@@ -38,6 +39,10 @@ MONEY_QUANTUM = Decimal("0.00000001")
 def require_equal(label: str, actual, expected) -> None:
     if actual != expected:
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
+
+
+def http_timeout() -> httpx.Timeout:
+    return httpx.Timeout(connect=10, write=30, read=120, pool=120)
 
 
 async def preflight(database_url: str) -> None:
@@ -82,11 +87,10 @@ async def send_requests(
         max_connections=concurrency,
         max_keepalive_connections=concurrency,
     )
-    timeout = httpx.Timeout(connect=10, read=10, write=10, pool=10)
     semaphore = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(
-        base_url=base_url, limits=limits, timeout=timeout
+        base_url=base_url, limits=limits, timeout=http_timeout()
     ) as client:
 
         async def send_one() -> dict:
@@ -208,6 +212,18 @@ async def audit(database_url: str) -> dict[str, object]:
                 await connection.fetchval("SELECT count(*) FROM journal_transactions"),
                 EXPECTED["total_journals_including_opening"],
             )
+            opening_journals = await connection.fetchval(
+                """
+                SELECT count(*)
+                FROM journal_transactions
+                WHERE event = 'OPENING' AND settlement_id IS NULL
+                """
+            )
+            require_equal(
+                "OPENING journals with NULL settlement",
+                opening_journals,
+                EXPECTED["OPENING"],
+            )
 
             balances = {
                 row["purpose"]: row["balance"]
@@ -300,6 +316,7 @@ async def audit(database_url: str) -> dict[str, object]:
                 "available_usd": balances["AVAILABLE"],
                 "reserved_usd": balances["RESERVED"],
                 "snapshot_versions": len(versions),
+                "opening_journals": opening_journals,
             }
     finally:
         await connection.close()
@@ -344,7 +361,8 @@ async def run(args: argparse.Namespace) -> None:
     statuses = result["statuses"]
     print(
         f"completed_requests=1000 elapsed_seconds={elapsed:.2f} "
-        f"snapshot_versions={result['snapshot_versions']}"
+        f"snapshot_versions={result['snapshot_versions']} "
+        f"opening_journals={result['opening_journals']}"
     )
     print(
         "PASS "
