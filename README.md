@@ -6,6 +6,11 @@ reserves customer USD through a double-entry ledger, calls an idempotent mock
 payout provider without holding database locks, and durably reconciles
 ambiguous provider outcomes without risking a duplicate payout.
 
+## Project links
+
+- [GitHub repository](https://github.com/vaibhav0806/netaro-settlement-router)
+- [Screen recording](https://drive.google.com/file/d/1sFnfUIfQjNlLL8n2AUmEtV7EfydOOkH8/view?usp=sharing)
+
 ## Important files
 
 | File | Purpose |
