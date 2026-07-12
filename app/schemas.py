@@ -10,9 +10,7 @@ from app.routing import Currency
 
 
 class SettlementCreate(BaseModel):
-    amount_usd: Annotated[
-        Decimal, Field(gt=0, max_digits=24, decimal_places=8)
-    ]
+    amount_usd: Annotated[Decimal, Field(gt=0, max_digits=24, decimal_places=8)]
     target_currency: Currency
 
 

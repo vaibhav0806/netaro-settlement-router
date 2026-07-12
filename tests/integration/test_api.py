@@ -5,13 +5,13 @@ from uuid import uuid4
 import httpx
 import pytest
 import pytest_asyncio
+from conftest import ScriptedPayoutProvider
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db import DatabaseUnavailable, check_database
+from app.main import create_app
 from app.provider import PayoutTimeout, ProviderLookup, ProviderResult
 from app.routing import Currency, Edge, RateBook
-from app.main import create_app
-from conftest import ScriptedPayoutProvider
 
 
 async def test_app_exposes_only_approved_routes(session_factory):
@@ -77,6 +77,28 @@ async def test_check_database_wraps_sqlalchemy_failure_and_closes_session():
     assert sessions.session.executed
     assert sessions.session.exited
     assert sessions.session.closed
+
+
+async def test_check_database_wraps_dns_failure_and_closes_session():
+    class FailingSession:
+        closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exception_type, exception, traceback):
+            self.closed = True
+
+        async def execute(self, statement):
+            raise OSError("database host unavailable")
+
+    session = FailingSession()
+
+    with pytest.raises(DatabaseUnavailable) as captured:
+        await check_database(lambda: session)
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert session.closed
 
 
 @pytest_asyncio.fixture
@@ -208,6 +230,7 @@ async def test_reconciliation_is_idempotent(client_factory):
     first = await client.post(f"/settlements/{created.json()['id']}/reconcile")
     replay = await client.post(f"/settlements/{created.json()['id']}/reconcile")
 
+    assert created.status_code == 202
     assert created.json()["status"] == "PENDING_RECONCILIATION"
     assert first.status_code == replay.status_code == 200
     assert first.json()["status"] == replay.json()["status"] == "SUCCESS"

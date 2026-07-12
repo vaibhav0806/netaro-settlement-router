@@ -6,6 +6,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import pytest_asyncio
+from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -14,11 +15,10 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-from app.models import Base
+from alembic import command
 from app.provider import PayoutProvider, PayoutTimeout, ProviderLookup, ProviderResult
 from app.routing import Currency, Edge, RateBook
 from app.seed import seed_demo_accounts
-
 
 POSTGRES_HOST_PORT = os.getenv("POSTGRES_HOST_PORT", "5432")
 TEST_DATABASE_URL = (
@@ -35,18 +35,31 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
         ADMIN_DATABASE_URL, isolation_level="AUTOCOMMIT", poolclass=NullPool
     )
     async with admin_engine.connect() as connection:
-        await connection.execute(text("DROP DATABASE IF EXISTS netaro_test WITH (FORCE)"))
+        await connection.execute(
+            text("DROP DATABASE IF EXISTS netaro_test WITH (FORCE)")
+        )
         await connection.execute(text("CREATE DATABASE netaro_test"))
     await admin_engine.dispose()
 
+    def migrate() -> None:
+        config = Config("alembic.ini")
+        config.attributes["database_url"] = TEST_DATABASE_URL
+        command.upgrade(config, "head")
+
+    await asyncio.to_thread(migrate)
+
     engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     yield factory
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
     await engine.dispose()
+    admin_engine = create_async_engine(
+        ADMIN_DATABASE_URL, isolation_level="AUTOCOMMIT", poolclass=NullPool
+    )
+    async with admin_engine.connect() as connection:
+        await connection.execute(
+            text("DROP DATABASE IF EXISTS netaro_test WITH (FORCE)")
+        )
+    await admin_engine.dispose()
 
 
 @pytest_asyncio.fixture
@@ -56,7 +69,8 @@ async def clean_database(
     async with session_factory() as session:
         await session.execute(
             text(
-                "TRUNCATE TABLE postings, journal_transactions, settlements, accounts "
+                "TRUNCATE TABLE payout_attempts, mock_provider_operations, postings, "
+                "journal_transactions, settlements, accounts "
                 "RESTART IDENTITY CASCADE"
             )
         )
@@ -95,9 +109,7 @@ class ScriptedPayoutProvider(PayoutProvider):
         self.lookup_results = deque(lookup_results)
         self.initiate_calls: list[UUID] = []
         self.lookup_calls: list[UUID] = []
-        self.effective_operations: dict[
-            UUID, ProviderResult | PayoutTimeout
-        ] = {}
+        self.effective_operations: dict[UUID, ProviderResult | PayoutTimeout] = {}
         self.initiate_started = asyncio.Event()
         self.allow_initiate = asyncio.Event()
         if not paused:

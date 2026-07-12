@@ -18,7 +18,6 @@ from app.models import (
 )
 from app.routing import Currency
 
-
 AccountKey = tuple[str, Currency, AccountPurpose]
 
 
@@ -168,7 +167,11 @@ async def seed_demo_accounts(
     session.add_all([omnibus_usd, omnibus_usdc, available, reserved])
     await session.flush()
 
-    journal = JournalTransaction(settlement_id=None, event=JournalEvent.OPENING)
+    journal = JournalTransaction(
+        settlement_id=None,
+        event=JournalEvent.OPENING,
+        is_posted=False,
+    )
     session.add(journal)
     await session.flush()
     session.add_all(
@@ -191,6 +194,8 @@ async def seed_demo_accounts(
     )
     apply_posting(omnibus_usd, PostingSide.DEBIT, amount)
     apply_posting(available, PostingSide.CREDIT, amount)
+    await session.flush()
+    journal.is_posted = True
     await session.flush()
     await _validate_existing_seed(
         session,

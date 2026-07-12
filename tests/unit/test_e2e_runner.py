@@ -1,10 +1,9 @@
-import json
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
-
 
 MODULE_PATH = Path(__file__).parents[1] / "e2e" / "run.py"
 SPEC = importlib.util.spec_from_file_location("e2e_run", MODULE_PATH)
@@ -222,9 +221,7 @@ def test_teardown_runs_when_startup_raises(monkeypatch, tmp_path):
     )
 
     assert result == 1
-    assert commands[-1] == run.compose_command(
-        config, "down", "-v", "--remove-orphans"
-    )
+    assert commands[-1] == run.compose_command(config, "down", "-v", "--remove-orphans")
 
 
 def test_teardown_runs_if_capture_and_capture_error_write_both_raise(
@@ -259,9 +256,7 @@ def test_teardown_runs_if_capture_and_capture_error_write_both_raise(
     )
 
     assert result == 1
-    assert commands[-1] == run.compose_command(
-        config, "down", "-v", "--remove-orphans"
-    )
+    assert commands[-1] == run.compose_command(config, "down", "-v", "--remove-orphans")
 
 
 def test_port_selection_never_returns_the_same_port_twice(monkeypatch):
@@ -366,9 +361,7 @@ def test_all_persisted_process_output_and_errors_are_redacted(monkeypatch, tmp_p
 
     assert result == 0
     artifacts = {
-        path.name: path.read_text()
-        for path in tmp_path.iterdir()
-        if path.is_file()
+        path.name: path.read_text() for path in tmp_path.iterdir() if path.is_file()
     }
     assert all(secret not in contents for contents in artifacts.values())
     assert "up-stdout" in artifacts["readiness.log"]
@@ -387,7 +380,9 @@ def test_persisted_lifecycle_error_is_redacted(monkeypatch, tmp_path):
     def fail_health(*args, **kwargs):
         raise TimeoutError(f"postgresql://netaro:{secret}@db:5432/netaro")
 
-    monkeypatch.setattr(run.subprocess, "run", lambda command, **kwargs: completed(command))
+    monkeypatch.setattr(
+        run.subprocess, "run", lambda command, **kwargs: completed(command)
+    )
     monkeypatch.setattr(run, "wait_for_health", fail_health)
 
     result = run.run_scenario(

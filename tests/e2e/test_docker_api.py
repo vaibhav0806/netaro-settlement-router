@@ -10,7 +10,6 @@ from uuid import uuid4
 import httpx
 import pytest
 
-
 BASE_URL = os.environ.get("E2E_BASE_URL", "http://127.0.0.1:8000")
 OWNER = "demo-customer"
 
@@ -142,7 +141,7 @@ async def test_quote_replay_conflict_and_concurrent_idempotency() -> None:
             )
 
         responses = await asyncio.gather(*(replay() for _ in range(100)))
-        assert {response.status_code for response in responses} == {200}
+        assert {response.status_code for response in responses} <= {200, 202}
         assert len({response.json()["id"] for response in responses}) == 1
         assert {response.json()["status"] for response in responses} <= {
             "PAYOUT_IN_PROGRESS",
@@ -173,29 +172,38 @@ async def test_provider_distribution_and_reconciliation() -> None:
         responses = await asyncio.gather(*(create(index) for index in range(20)))
         elapsed = time.perf_counter() - started
         assert elapsed < 15
-        assert {response.status_code for response in responses} == {200}
+        assert Counter(response.status_code for response in responses) == {
+            200: 14,
+            202: 6,
+        }
         bodies = [response.json() for response in responses]
         assert Counter(body["status"] for body in bodies) == {
             "SUCCESS": 14,
-            "FAILED": 3,
-            "PENDING_RECONCILIATION": 3,
+            "PENDING_RECONCILIATION": 6,
         }
 
-        terminal = next(body for body in bodies if body["status"] == "SUCCESS")
+        settlement_ids = {body["id"] for body in bodies}
+        deadline = time.monotonic() + 10
+        final = []
+        while time.monotonic() < deadline:
+            fetched = await asyncio.gather(
+                *(client.get(f"/settlements/{item}") for item in settlement_ids)
+            )
+            final = [response.json() for response in fetched]
+            if all(body["status"] in {"SUCCESS", "FAILED"} for body in final):
+                break
+            await asyncio.sleep(0.1)
+        assert Counter(body["status"] for body in final) == {
+            "SUCCESS": 17,
+            "FAILED": 3,
+        }
+
+        terminal = final[0]
         terminal_reconcile = await client.post(
             f"/settlements/{terminal['id']}/reconcile"
         )
+        assert terminal_reconcile.status_code == 200
         assert terminal_reconcile.json() == terminal
-
-        pending = next(
-            body for body in bodies if body["status"] == "PENDING_RECONCILIATION"
-        )
-        for _ in range(2):
-            reconciled = await client.post(
-                f"/settlements/{pending['id']}/reconcile"
-            )
-            assert reconciled.status_code == 200
-            assert reconciled.json()["status"] == "PENDING_RECONCILIATION"
 
 
 @pytest.mark.concurrency_funds
@@ -239,7 +247,7 @@ async def test_settlement_is_persisted_for_runner_restart_check() -> None:
                 headers=headers(f"lifecycle-{index}"),
                 json={"amount_usd": "1", "target_currency": "EUR"},
             )
-            assert response.status_code == 200
+            assert response.status_code in {200, 202}
             created.append(response.json())
         terminal = next(row for row in created if row["status"] == "SUCCESS")
         pending = next(

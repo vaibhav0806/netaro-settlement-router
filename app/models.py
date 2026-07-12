@@ -6,10 +6,13 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
+    Identity,
     Index,
     Numeric,
     String,
@@ -75,8 +78,12 @@ class Account(Base):
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     owner_id: Mapped[str] = mapped_column(String, nullable=False)
     currency: Mapped[Currency] = mapped_column(currency_enum, nullable=False)
-    account_class: Mapped[AccountClass] = mapped_column(account_class_enum, nullable=False)
-    purpose: Mapped[AccountPurpose] = mapped_column(account_purpose_enum, nullable=False)
+    account_class: Mapped[AccountClass] = mapped_column(
+        account_class_enum, nullable=False
+    )
+    purpose: Mapped[AccountPurpose] = mapped_column(
+        account_purpose_enum, nullable=False
+    )
     balance: Mapped[Decimal] = mapped_column(
         Numeric(24, 8), nullable=False, default=Decimal("0")
     )
@@ -110,7 +117,9 @@ class Settlement(Base):
     aggregate_rate: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
     quoted_amount: Mapped[Decimal] = mapped_column(Numeric(32, 8), nullable=False)
     provider_operation_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
-    status: Mapped[SettlementStatus] = mapped_column(settlement_status_enum, nullable=False)
+    status: Mapped[SettlementStatus] = mapped_column(
+        settlement_status_enum, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -137,6 +146,9 @@ class JournalTransaction(Base):
         ForeignKey("settlements.id"), nullable=True
     )
     event: Mapped[JournalEvent] = mapped_column(journal_event_enum, nullable=False)
+    is_posted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -169,3 +181,37 @@ class Posting(Base):
     side: Mapped[PostingSide] = mapped_column(posting_side_enum, nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
     journal: Mapped[JournalTransaction] = relationship(back_populates="postings")
+
+
+class MockProviderOperation(Base):
+    __tablename__ = "mock_provider_operations"
+
+    operation_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(),
+        nullable=False,
+        unique=True,
+    )
+    submission_outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    authoritative_outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_reference: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class PayoutAttempt(Base):
+    __tablename__ = "payout_attempts"
+    __table_args__ = (
+        CheckConstraint("attempt_token > 0", name="ck_payout_attempt_token_positive"),
+    )
+
+    settlement_id: Mapped[UUID] = mapped_column(
+        ForeignKey("settlements.id"), primary_key=True
+    )
+    operation_id: Mapped[UUID] = mapped_column(Uuid, nullable=False, unique=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_reference: Mapped[str | None] = mapped_column(String(64), nullable=True)

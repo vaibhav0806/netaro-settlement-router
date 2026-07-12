@@ -45,11 +45,13 @@ Client -> FastAPI -> settlement orchestrator ------+
   snapshot every 50 ms.
 - **Router:** precomputes best USD routes for the current snapshot.
 - **Ledger service:** writes immutable journals and updates materialized account
-  balances in the same transaction.
-- **Payout provider:** returns success, definitive failure, or an ambiguous
-  timeout and deduplicates operations by settlement ID.
-- **Reconciliation service:** queries an existing provider operation and applies
-  a definitive result without blindly retrying it.
+  balances in the same transaction; database triggers enforce balance and
+  posted-journal immutability.
+- **Payout provider:** persists operations, returns success or an ambiguous
+  transport outcome, and deduplicates operations by settlement ID.
+- **Reconciliation service:** claims attempts using expiring leases and
+  `SKIP LOCKED`, queries existing provider operations, and applies authoritative
+  results without blindly retrying them. Attempt tokens fence stale workers.
 
 ## FX routing
 
@@ -90,6 +92,9 @@ created through an opening journal rather than direct balance mutation.
 `CONSUME`, or `RELEASE`. A unique settlement/event constraint prevents duplicate
 financial effects. Immutable `postings` contain an account, debit/credit side,
 positive amount, and currency. Account balances and postings change atomically.
+`journal_transactions.is_posted` closes a journal after its postings are
+written. Deferred PostgreSQL triggers reject unbalanced posted journals, and
+triggers prevent later updates or deletes to posted journals and postings.
 
 ```text
 Reservation: Debit Customer Available USD / Credit Customer Reserved USD
@@ -105,6 +110,14 @@ status, and timestamps. `(owner_id, idempotency_key)` is unique. Reusing a key
 with the same fingerprint returns the existing settlement; a different
 fingerprint is a conflict.
 
+### Payout operations and attempts
+
+`mock_provider_operations` durably records the provider operation and hidden
+authoritative outcome. `payout_attempts` records the operation ID, attempt
+state, fencing token, lease expiry, and last observed outcome. Another process
+can safely resume reconciliation after a crash without changing the provider
+idempotency key.
+
 ## State machine
 
 ```text
@@ -115,7 +128,7 @@ PENDING_RECONCILIATION --------> SUCCESS | FAILED
 ```
 
 The three outcome states are `SUCCESS`, `FAILED`, and
-`PENDING_RECONCILIATION`; pending remains unresolved and can later transition.
+`PENDING_RECONCILIATION`; pending is non-terminal and can later transition.
 `RESERVED` and `PAYOUT_IN_PROGRESS` are persisted recovery states. The status
 endpoint may expose either transient state during processing or after a crash;
 they are not additional final outcomes.
@@ -137,9 +150,10 @@ they are not additional final outcomes.
 5. Call the provider outside database transactions using the settlement ID as
    its idempotency key.
 6. In a new transaction, lock and recheck the settlement and account rows:
-   - `200`: consume the reservation and set `SUCCESS`.
-   - `503`: release it and set `FAILED`.
-   - Timeout: retain it and set `PENDING_RECONCILIATION`.
+   - Authoritative paid: consume the reservation and set `SUCCESS`.
+   - Authoritative unpaid: release it and set `FAILED`.
+   - Timeout, `503`, or other transport ambiguity: retain it and set
+     `PENDING_RECONCILIATION`.
 7. Reconciliation looks up the same operation. Paid consumes the reserve,
    unpaid releases it, and unknown leaves it pending.
 
@@ -153,15 +167,19 @@ submit with the same idempotency key only when the provider definitively reports
 that no operation exists. It never resubmits an ambiguous operation.
 
 The provider operation ID is the settlement UUID, assigned and persisted when
-the settlement row is created. It is stable across replay and recovery.
+the settlement row is created. It is stable across replay and recovery. The
+background worker claims due attempts in short transactions, performs lookup
+outside the transaction, then applies the result only if its fencing token
+still owns the lease.
 
 ## API
 
-- `POST /settlements`: create or replay an idempotent settlement.
+- `POST /settlements`: create or replay an idempotent settlement; returns `202`
+  while reconciliation is pending and `200` for terminal results.
 - `GET /settlements/{settlement_id}`: return status, quote, route, and reserve
   disposition.
 - `POST /settlements/{settlement_id}/reconcile`: query and apply an existing
-  provider operation's definitive result.
+  provider operation's authoritative result; returns `202` while still pending.
 - `GET /health`: execute PostgreSQL `SELECT 1`; return `200` when ready and
   `503` when the database is unavailable.
 
@@ -171,8 +189,8 @@ Docker Compose runs the API and PostgreSQL, waits for database readiness, runs
 migrations and idempotent seed data, and starts the rate publisher with the
 FastAPI lifecycle. Provider outcomes can be deterministic during tests.
 
-The 1,000-request load test verifies balances, balanced journals, unique
-settlement effects, released failed amounts, retained pending amounts, and
-exactly-once consumption of successful amounts. At 10,000 RPS, hot account
+The 1,000-request load test verifies balances, balanced and immutable journals,
+unique settlement effects, released failed amounts, zero terminal pending
+operations, and exactly-once consumption of successful amounts. At 10,000 RPS, hot account
 rows, the database pool/WAL, synchronous provider waits, and per-process rate
 snapshots become the primary bottlenecks.

@@ -13,9 +13,9 @@ Rates are positive, linear `Decimal` values. Fees, capacity, slippage, quote
 expiry, and LP execution are out of scope, so the best route is independent of
 amount. Only USD reservation and settlement are posted; the route and receiver
 quote are audit metadata. Customer available/reserved accounts are liabilities
-and Omnibus USD is an asset. `503` is assumed definitively unpaid because the
-brief marks only timeouts as ambiguous. The provider deduplicates and supports
-status lookup by settlement ID.
+and Omnibus USD is an asset. Timeouts, `503`, and other transport failures are
+ambiguous; only an authoritative provider status may release reserved funds.
+The provider deduplicates and supports durable status lookup by settlement ID.
 
 ## Decision
 
@@ -28,7 +28,8 @@ fingerprint. Each transition locks the settlement and affected account rows
 using `SELECT FOR UPDATE`, with accounts locked in ascending ID order. It
 rechecks status and funds, writes one balanced journal, updates materialized
 balances, and commits. Unique settlement/event journals make financial effects
-idempotent.
+idempotent. Deferred PostgreSQL triggers enforce balanced journals and prevent
+updates or deletes after a journal is posted.
 
 Reservation moves Customer Available USD to Customer Reserved USD. The payout
 call occurs only after a conditional `RESERVED -> PAYOUT_IN_PROGRESS`
@@ -36,12 +37,15 @@ transition commits, and no database transaction remains open during network
 I/O. Success consumes the reserve against Omnibus USD; definitive failure
 releases it. Timeout retains it as `PENDING_RECONCILIATION`. Reconciliation
 queries the provider and atomically consumes or releases once; it never blindly
-retries.
+retries. Payout attempts persist leases and fencing tokens; reconcilers claim
+batches using `SKIP LOCKED`, perform lookup outside the transaction, and apply
+results only while their token remains current.
 
 This prevents overspend and lost updates, limits deadlocks, and avoids holding
 locks or connections for a five-second provider call. Recovery queries a
 `PAYOUT_IN_PROGRESS` operation and submits with the same idempotency key only
-if the provider definitively reports that no operation exists.
+if the provider definitively reports that no operation exists. The assignment
+provider stores operations durably so restart recovery exercises this contract.
 
 ### Routing
 
@@ -50,6 +54,10 @@ Bellman-Ford from USD with deterministic tie-breaking and `(currency, LP)`
 predecessors. Reject non-positive rates and snapshots with a reachable
 profitable cycle. Snapshot computation is `O(VE)`; requests use `O(1)` target
 lookup plus `O(V)` path reconstruction.
+
+All rate and money calculations use `Decimal` inside an isolated 38-digit,
+half-even context. Property tests compare routing results against exhaustive
+simple-path enumeration, independently of the implementation algorithm.
 
 This deliberately differs from the brief's `O(V+E)` wording. A general cyclic,
 weighted FX graph cannot maximize a multiplicative path with BFS, while

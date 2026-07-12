@@ -13,6 +13,8 @@ from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 
+from app.decimal_policy import isolated_decimal
+
 
 class Currency(StrEnum):
     USD = "USD"
@@ -75,9 +77,11 @@ def _is_better(candidate: Candidate, current: Candidate | None) -> bool:
 
 def _collapsed_edges(edges: tuple[Edge, ...]) -> tuple[Edge, ...]:
     selected: dict[tuple[Currency, Currency], Edge] = {}
-    for edge in sorted(edges, key=lambda item: (item.source.value, item.target.value, item.lp)):
-        if edge.rate <= 0:
-            raise InvalidRateGraph("rates must be positive")
+    for edge in sorted(
+        edges, key=lambda item: (item.source.value, item.target.value, item.lp)
+    ):
+        if not edge.rate.is_finite() or edge.rate <= 0:
+            raise InvalidRateGraph("rates must be positive and finite")
         key = (edge.source, edge.target)
         current = selected.get(key)
         if current is None or edge.rate > current.rate:
@@ -85,7 +89,9 @@ def _collapsed_edges(edges: tuple[Edge, ...]) -> tuple[Edge, ...]:
     return tuple(selected.values())
 
 
-def _relax(best: dict[Currency, Candidate], edges: tuple[Edge, ...]) -> dict[Currency, Candidate]:
+def _relax(
+    best: dict[Currency, Candidate], edges: tuple[Edge, ...]
+) -> dict[Currency, Candidate]:
     next_best = best.copy()
     for edge in edges:
         source = best.get(edge.source)
@@ -98,7 +104,7 @@ def _relax(best: dict[Currency, Candidate], edges: tuple[Edge, ...]) -> dict[Cur
     return next_best
 
 
-def compute_routes(
+def _compute_routes(
     edges: tuple[Edge, ...],
     version: int,
     source: Currency = Currency.USD,
@@ -129,7 +135,15 @@ def compute_routes(
     )
 
 
-def generate_edges(version: int) -> tuple[Edge, ...]:
+def compute_routes(
+    edges: tuple[Edge, ...],
+    version: int,
+    source: Currency = Currency.USD,
+) -> Mapping[Currency, RouteQuote]:
+    return isolated_decimal(lambda: _compute_routes(edges, version, source))
+
+
+def _generate_edges(version: int) -> tuple[Edge, ...]:
     base_anchors = {
         Currency.USD: Decimal("1"),
         Currency.USDC: Decimal("1"),
@@ -146,7 +160,10 @@ def generate_edges(version: int) -> tuple[Edge, ...]:
     }
     anchors = {
         currency: anchor
-        * (Decimal("1") + Decimal((version * coefficients[currency]) % 7 - 3) / Decimal("10000"))
+        * (
+            Decimal("1")
+            + Decimal((version * coefficients[currency]) % 7 - 3) / Decimal("10000")
+        )
         for currency, anchor in base_anchors.items()
     }
     lp_factors = {
@@ -161,6 +178,10 @@ def generate_edges(version: int) -> tuple[Edge, ...]:
         if source != target
         for lp, factor in lp_factors.items()
     )
+
+
+def generate_edges(version: int) -> tuple[Edge, ...]:
+    return isolated_decimal(lambda: _generate_edges(version))
 
 
 class RateBook:
@@ -202,5 +223,6 @@ class RateBook:
     async def _run(self) -> None:
         while True:
             await asyncio.sleep(self._interval_seconds)
+            assert self._snapshot is not None
             version = self._snapshot.version + 1
             self.publish(self._edge_factory(version), version)

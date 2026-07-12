@@ -120,9 +120,7 @@ def test_rate_book_publishes_and_quotes_one_complete_snapshot():
     assert quote.snapshot_version == snapshot.version
     assert quote.target == Currency.PHP
     assert quote.aggregate_rate == Decimal("55")
-    assert quote.hops[0] == RouteHop(
-        Currency.USD, Currency.PHP, "LP_A", Decimal("55")
-    )
+    assert quote.hops[0] == RouteHop(Currency.USD, Currency.PHP, "LP_A", Decimal("55"))
 
 
 def test_invalid_publication_preserves_last_valid_snapshot():
@@ -186,9 +184,7 @@ def test_concurrent_readers_only_observe_complete_versions():
         start.wait()
         for iteration in range(100_000):
             quote = book.quote(Currency.PHP)
-            observed.add(
-                (quote.snapshot_version, quote.hops, quote.aggregate_rate)
-            )
+            observed.add((quote.snapshot_version, quote.hops, quote.aggregate_rate))
             observed_versions[quote.snapshot_version].set()
             if iteration >= 4_000 and publishing_done.is_set():
                 break

@@ -3,8 +3,8 @@
 Netaro Router is a FastAPI/PostgreSQL implementation of an atomic FX
 settlement loop. It selects the route that maximizes the receiver's output,
 reserves customer USD through a double-entry ledger, calls an idempotent mock
-payout provider without holding database locks, and deterministically handles
-success, definitive failure, and ambiguous timeout outcomes.
+payout provider without holding database locks, and durably reconciles
+ambiguous provider outcomes without risking a duplicate payout.
 
 ## Important files
 
@@ -19,7 +19,7 @@ success, definitive failure, and ambiguous timeout outcomes.
 | [Docker E2E design](docs/superpowers/specs/2026-07-12-docker-e2e-audit-design.md) | Reviewed isolation, scenario, lifecycle, artifact, and audit design |
 | [Docker E2E plan](docs/superpowers/plans/2026-07-12-docker-e2e-audit.md) | End-to-end, lifecycle, concurrency, evidence, and audit plan |
 | [Application](app/) | FastAPI service, routing engine, payout provider, ledger, models, and settlement state machine |
-| [Database migration](alembic/versions/0001_initial.py) | PostgreSQL schema, constraints, indexes, and seeded ledger accounts |
+| [Database migrations](alembic/versions/) | PostgreSQL schema, ledger guards, payout-attempt persistence, indexes, and seeded accounts |
 | [Automated tests](tests/) | Unit, PostgreSQL integration, isolated Docker E2E, and canonical load proof |
 | [Docker E2E runner](tests/e2e/run.py) | Fresh-project orchestration, health checks, lifecycle tests, invariant audit, redacted artifacts, and cleanup |
 | [1,000-request load proof](tests/load_test.py) | Concurrent HTTP workload followed by a read-only accounting and routing audit |
@@ -49,16 +49,18 @@ Key correctness properties:
   exact snapshot version, route, LPs, rates, aggregate rate, and quoted output.
 - Customer funds move between USD `AVAILABLE` and `RESERVED` accounts using
   balanced double-entry journals. Successful payouts consume the reservation;
-  definitive failures release it.
+  authoritative unpaid results release it. PostgreSQL deferred triggers reject
+  unbalanced journals and prevent changes to posted journals and postings.
 - The owner/idempotency-key database constraint and request fingerprint make
   replay safe. Equivalent decimal inputs replay the original result; changed
   payloads return `409`.
 - Account rows are locked in a deterministic order using `SELECT FOR UPDATE`.
   Locks are held only in short database transactions, never during provider
   calls.
-- A payout timeout is ambiguous. Funds remain reserved and the settlement
+- A payout timeout or transport failure is ambiguous. Funds remain reserved and the settlement
   becomes `PENDING_RECONCILIATION`; the service does not immediately retry.
-  Reconciliation queries the original provider operation ID.
+  A leased background reconciler queries the original durable provider
+  operation. Attempt tokens fence stale workers from applying an outcome.
 - The health endpoint checks PostgreSQL and returns `200` with
   `{"status":"ok"}` or `503` while the database is unavailable.
 
@@ -68,22 +70,21 @@ currency values remain quote and audit metadata.
 
 ## Audit summary
 
-The full evidence and coverage matrix are in [AUDIT.md](AUDIT.md). The recorded
-verification ran against source commit
-`9baac53d8b425a98c7b4a46b57ff40ea24e57044`.
+The full evidence, exact source revision, and coverage matrix are in
+[AUDIT.md](AUDIT.md).
 
 | Verification lane | Recorded result |
 |---|---:|
-| Unit tests | 40 passed |
-| PostgreSQL integration tests | 78 passed |
-| Combined unit and integration | 118 passed in 36.13s |
+| Unit tests | 42 passed |
+| PostgreSQL integration tests | 87 passed |
+| Combined unit and integration | 129 passed |
 | Isolated Docker E2E scenarios | 5 passed |
 | Canonical load workload | 1,000/1,000 requests completed |
-| Load duration | 10.08 seconds |
-| Provider outcomes | 700 success / 150 failed / 150 pending |
-| Routing snapshots exercised | 47 |
-| Ledger journals | 1 opening + 1,850 settlement journals |
-| Final available/reserved USD | 15,000 / 15,000 |
+| Load duration | 11.76 seconds |
+| Final provider outcomes | 850 success / 150 failed / 0 pending |
+| Routing snapshots exercised | 59 |
+| Ledger journals | 1 opening + 2,000 settlement journals |
+| Final available/reserved USD | 15,000 / 0 |
 | Negative accounts | 0 |
 | Unbalanced journal/currency groups | 0 |
 | Duplicate owner/key or settlement/event rows | 0 |
@@ -116,8 +117,10 @@ Expected response:
 {"status":"ok"}
 ```
 
-The default mock provider produces 70% paid, 15% definitively unpaid, and 15%
-five-second timeout outcomes over each group of 20 unique operations.
+The deterministic mock provider initially produces 70% paid, 15% ambiguous
+`503`, and 15% five-second timeout outcomes over each group of 20 unique
+operations. Its operations are stored in PostgreSQL. Reconciliation eventually
+resolves ambiguous operations to an exact 50/50 paid/unpaid split.
 
 To stop the application while preserving its database volume:
 
@@ -146,16 +149,17 @@ Use the returned settlement UUID to read its durable state:
 curl --fail http://localhost:8000/settlements/<settlement-uuid>
 ```
 
-Reconcile an ambiguous timeout:
+Request immediate reconciliation of an ambiguous operation:
 
 ```bash
 curl --fail --request POST \
   http://localhost:8000/settlements/<settlement-uuid>/reconcile
 ```
 
-Reconciliation is idempotent. It performs provider lookup for the existing
-operation and never creates a second payout. Terminal settlements are returned
-unchanged.
+Reconciliation is also automatic. Manual reconciliation is idempotent, queries
+the existing operation, and never creates a second payout. Terminal settlements
+are returned unchanged. Create and reconcile return `202` while an operation is
+still pending and `200` for a terminal result.
 
 ## Install host test dependencies
 
@@ -193,6 +197,15 @@ POSTGRES_HOST_PORT=55432 .venv/bin/pytest tests/integration -q
 
 The integration fixtures create and destroy a separate `netaro_test` database.
 
+Run formatting, lint, static typing, and bytecode compilation:
+
+```bash
+.venv/bin/ruff format --check app tests
+.venv/bin/ruff check app tests
+.venv/bin/mypy app
+.venv/bin/python -m compileall -q app tests
+```
+
 ## Run isolated Docker E2E scenarios
 
 Each scenario selects unused host ports, builds the application, starts a
@@ -216,9 +229,10 @@ The scenarios cover:
 - API validation, disabled docs, stable error contracts, and health behavior;
 - quote arithmetic, changing rate snapshots, replay, conflicts, and 100
   concurrent requests using the same idempotency key;
-- the exact 14/3/3 provider distribution across 20 concurrent requests;
+- the exact 14 successful/6 pending initial provider distribution and eventual
+  17 successful/3 failed terminal distribution across 20 concurrent requests;
 - 101 concurrent USD 1,000 settlements against USD 100,000 without overspend;
-- API restart persistence, provider-memory loss, ambiguous reconciliation,
+- API restart persistence, durable provider lookup, automatic reconciliation,
   database outage and recovery;
 - read-only checks for negative accounts, unbalanced journals, duplicate
   owner/key rows, and duplicate settlement/event rows.
@@ -258,7 +272,7 @@ from its snapshot version and checked for exact receiver output.
 Expected final line:
 
 ```text
-PASS settlements=1000 success=700 failed=150 pending=150 settlement_journals=1850 available_usd=15000 reserved_usd=15000
+PASS settlements=1000 success=850 failed=150 pending=0 settlement_journals=2000 available_usd=15000 reserved_usd=0
 ```
 
 ## Scope and production limits
@@ -270,11 +284,12 @@ failure safety within the assignment's four-hour boundary.
 It does not implement real LP or payout integrations, LP fees, liquidity
 capacity, slippage, quote expiry, target-currency ledger valuation,
 authentication/authorization, customer-account provisioning, a durable payout
-queue/outbox, a production reconciliation scheduler, distributed rate
+queue/outbox, distributed rate
 snapshots, horizontal worker partitioning, or production observability.
 
-The mock provider is process-local. After a restart, an ambiguous settlement
-remains safely reserved and pending, but a real deployment needs a durable
-provider operation/query API. The local Docker load result is a correctness
-proof, not a claim of production throughput. The proposed path to 10,000 RPS
-is documented in [ARCHITECTURE.md](ARCHITECTURE.md) and [ADR.md](ADR.md).
+The included mock provider persists operations locally in PostgreSQL to make
+restart and reconciliation behavior testable; a real deployment still needs a
+durable external provider operation/query API. The local Docker load result is
+a correctness proof, not a claim of production throughput. The proposed path
+to 10,000 RPS is documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
+[ADR.md](ADR.md).

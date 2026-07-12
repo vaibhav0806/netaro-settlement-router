@@ -69,7 +69,11 @@ async def _post(
     if debit.balance < amount:
         raise InsufficientFunds
 
-    journal = JournalTransaction(settlement_id=settlement.id, event=event)
+    journal = JournalTransaction(
+        settlement_id=settlement.id,
+        event=event,
+        is_posted=False,
+    )
     session.add(journal)
     await session.flush()
     session.add_all(
@@ -92,6 +96,8 @@ async def _post(
     )
     apply_posting(debit, PostingSide.DEBIT, amount)
     apply_posting(credit, PostingSide.CREDIT, amount)
+    await session.flush()
+    journal.is_posted = True
 
 
 async def reserve(session: AsyncSession, settlement: Settlement) -> None:
@@ -131,8 +137,7 @@ async def assert_ledger_invariants(session: AsyncSession) -> None:
         if isinstance(value, Account)
     ]
     assert all(
-        account.balance is None or account.balance >= 0
-        for account in tracked_accounts
+        account.balance is None or account.balance >= 0 for account in tracked_accounts
     ), "negative account balance"
     await session.flush()
     accounts = (
@@ -144,20 +149,18 @@ async def assert_ledger_invariants(session: AsyncSession) -> None:
         )
     ).all()
     postings = (
-        await session.scalars(
-            select(Posting).execution_options(populate_existing=True)
-        )
+        await session.scalars(select(Posting).execution_options(populate_existing=True))
     ).all()
     assert all(account.balance >= 0 for account in accounts), "negative account balance"
-    journal_totals: dict[
-        tuple[object, Currency], dict[PostingSide, Decimal]
-    ] = defaultdict(lambda: defaultdict(Decimal))
+    journal_totals: dict[tuple[object, Currency], dict[PostingSide, Decimal]] = (
+        defaultdict(lambda: defaultdict(Decimal))
+    )
     expected_balances = {account.id: Decimal("0") for account in accounts}
     account_by_id = {account.id: account for account in accounts}
     for posting in postings:
-        journal_totals[(posting.journal_id, posting.currency)][
-            posting.side
-        ] += posting.amount
+        journal_totals[(posting.journal_id, posting.currency)][posting.side] += (
+            posting.amount
+        )
         account = account_by_id[posting.account_id]
         increases = (
             account.account_class == AccountClass.ASSET

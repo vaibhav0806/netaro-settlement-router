@@ -2,6 +2,7 @@ import asyncio
 from decimal import Decimal
 from uuid import uuid4
 
+from conftest import ScriptedPayoutProvider
 from sqlalchemy import func, select
 
 from app.ledger import InsufficientFunds, reserve
@@ -18,8 +19,6 @@ from app.routing import Currency
 from app.schemas import SettlementCreate, request_fingerprint
 from app.seed import seed_demo_accounts
 from app.service import SettlementService
-from conftest import ScriptedPayoutProvider
-
 
 COMMAND = SettlementCreate(amount_usd=Decimal("20"), target_currency=Currency.PHP)
 
@@ -112,11 +111,14 @@ async def test_unique_requests_cannot_overspend_while_payouts_are_paused(
     )
 
     assert sum(isinstance(result, InsufficientFunds) for result in results) == 50
-    assert sum(
-        not isinstance(result, BaseException)
-        and result.status == SettlementStatus.SUCCESS
-        for result in results
-    ) == 50
+    assert (
+        sum(
+            not isinstance(result, BaseException)
+            and result.status == SettlementStatus.SUCCESS
+            for result in results
+        )
+        == 50
+    )
     assert len(provider.initiate_calls) == 50
 
 
@@ -141,9 +143,7 @@ async def test_mixed_concurrent_wave_exhausts_balance_and_rejects_remainder(
             service.create(
                 "customer",
                 f"mixed-{index}",
-                SettlementCreate(
-                    amount_usd=amount, target_currency=Currency.PHP
-                ),
+                SettlementCreate(amount_usd=amount, target_currency=Currency.PHP),
             )
         )
         for index, amount in enumerate(amounts)
@@ -164,9 +164,7 @@ async def test_mixed_concurrent_wave_exhausts_balance_and_rejects_remainder(
             await asyncio.sleep(0.01)
 
     try:
-        paused_balances = await asyncio.wait_for(
-            wait_until_exhausted(), timeout=20
-        )
+        paused_balances = await asyncio.wait_for(wait_until_exhausted(), timeout=20)
     finally:
         provider.allow_initiate.set()
         results = await asyncio.wait_for(
@@ -211,11 +209,14 @@ async def test_fifty_competing_success_finalizers_consume_once(
     service = SettlementService(session_factory, rate_book, provider)
     pending = await service.create("customer", "pending", COMMAND)
 
-    results = await asyncio.gather(
-        *(service.reconcile(pending.id) for _ in range(50))
-    )
+    results = await asyncio.gather(*(service.reconcile(pending.id) for _ in range(50)))
 
-    assert all(result.status == SettlementStatus.SUCCESS for result in results)
+    assert {result.status for result in results} <= {
+        SettlementStatus.PENDING_RECONCILIATION,
+        SettlementStatus.SUCCESS,
+    }
+    assert (await service.get(pending.id)).status == SettlementStatus.SUCCESS
+    assert provider.lookup_calls == [pending.id]
     async with session_factory() as session:
         consume_count = await session.scalar(
             select(func.count())
@@ -271,13 +272,16 @@ async def test_concurrent_not_found_recovery_has_one_effective_operation(
     service = SettlementService(session_factory, rate_book, provider)
     tasks = [asyncio.create_task(service.reconcile(settlement_id)) for _ in range(10)]
     try:
-        await asyncio.wait_for(provider.wait_for_initiations(10), timeout=10)
+        await asyncio.wait_for(provider.wait_for_initiations(1), timeout=10)
         assert len(provider.effective_operations) == 1
     finally:
         provider.allow_initiate.set()
     results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=20)
 
-    assert all(result == results[0] for result in results)
-    assert results[0].status == SettlementStatus.SUCCESS
-    assert provider.initiate_calls == [settlement_id] * 10
+    assert {result.status for result in results} <= {
+        SettlementStatus.PAYOUT_IN_PROGRESS,
+        SettlementStatus.SUCCESS,
+    }
+    assert (await service.get(settlement_id)).status == SettlementStatus.SUCCESS
+    assert provider.initiate_calls == [settlement_id]
     assert provider.effective_operations == {settlement_id: ProviderResult.PAID}

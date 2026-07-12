@@ -111,9 +111,9 @@ async def test_insufficient_funds_writes_no_journal(seeded_accounts, session):
     await session.commit()
 
     count = await session.scalar(
-        select(func.count()).select_from(JournalTransaction).where(
-            JournalTransaction.event == JournalEvent.RESERVE
-        )
+        select(func.count())
+        .select_from(JournalTransaction)
+        .where(JournalTransaction.event == JournalEvent.RESERVE)
     )
     assert count == 0
 
@@ -174,11 +174,10 @@ async def test_every_journal_balances_per_currency(seeded_accounts, session):
             .scalar_subquery(),
         )
     )
-    await session.execute(
-        update(Posting).where(Posting.id == credit.id).values(amount=Decimal("39"))
-    )
-    with pytest.raises(AssertionError, match="unbalanced journal currency"):
-        await assert_ledger_invariants(session)
+    with pytest.raises(IntegrityError, match="postings are immutable"):
+        await session.execute(
+            update(Posting).where(Posting.id == credit.id).values(amount=Decimal("39"))
+        )
     await session.rollback()
 
 
@@ -284,7 +283,9 @@ async def test_concurrent_seed_is_idempotent(session_factory, clean_database):
         await assert_ledger_invariants(session)
 
 
-async def test_invariant_check_reports_negative_pending_balance(seeded_accounts, session):
+async def test_invariant_check_reports_negative_pending_balance(
+    seeded_accounts, session
+):
     account = await session.scalar(
         select(Account).where(
             Account.owner_id == "customer",
@@ -420,9 +421,7 @@ async def test_invariant_audit_waits_for_concurrent_ledger_commit(
     finally:
         allow_commit.set()
         tasks = [
-            task
-            for task in (writer_task, ready_task, audit_task)
-            if task is not None
+            task for task in (writer_task, ready_task, audit_task) if task is not None
         ]
         for task in tasks:
             if not task.done():
@@ -455,14 +454,8 @@ async def test_seed_rejects_missing_opening_effect(session):
             JournalTransaction.event == JournalEvent.OPENING
         )
     )
-    await session.execute(delete(Posting).where(Posting.journal_id == opening_id))
-    await session.execute(
-        delete(JournalTransaction).where(JournalTransaction.id == opening_id)
-    )
-    await session.commit()
-
-    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
-        await seed_demo_accounts(session, "customer", Decimal("1000"))
+    with pytest.raises(IntegrityError, match="postings are immutable"):
+        await session.execute(delete(Posting).where(Posting.journal_id == opening_id))
     await session.rollback()
 
 
@@ -474,31 +467,24 @@ async def test_seed_rejects_corrupt_opening_effect(session):
             JournalTransaction.event == JournalEvent.OPENING
         )
     )
-    await session.execute(
-        update(Posting)
-        .where(
-            Posting.journal_id == opening_id,
-            Posting.side == "CREDIT",
+    with pytest.raises(IntegrityError, match="postings are immutable"):
+        await session.execute(
+            update(Posting)
+            .where(
+                Posting.journal_id == opening_id,
+                Posting.side == "CREDIT",
+            )
+            .values(amount=Decimal("999"))
         )
-        .values(amount=Decimal("999"))
-    )
-    await session.commit()
-
-    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
-        await seed_demo_accounts(session, "customer", Decimal("1000"))
     await session.rollback()
 
 
 async def test_seed_rejects_duplicate_opening_journal(session):
     await seed_demo_accounts(session, "customer", Decimal("1000"))
     await session.commit()
-    session.add(
-        JournalTransaction(settlement_id=None, event=JournalEvent.OPENING)
-    )
-    await session.commit()
-
-    with pytest.raises(RuntimeError, match="seed state is inconsistent"):
-        await seed_demo_accounts(session, "customer", Decimal("1000"))
+    session.add(JournalTransaction(settlement_id=None, event=JournalEvent.OPENING))
+    with pytest.raises(IntegrityError, match="journal must be posted"):
+        await session.commit()
     await session.rollback()
 
 
@@ -561,18 +547,24 @@ async def test_seed_is_noop_after_valid_ledger_evolution(session, terminal_event
     await seed_demo_accounts(session, "customer", Decimal("1000"))
     await session.commit()
 
-    assert dict(
-        (
-            await session.execute(
-                select(Account.id, Account.balance).order_by(Account.id)
-            )
-        ).all()
-    ) == before_balances
+    assert (
+        dict(
+            (
+                await session.execute(
+                    select(Account.id, Account.balance).order_by(Account.id)
+                )
+            ).all()
+        )
+        == before_balances
+    )
     assert (
         await session.scalar(select(func.count()).select_from(JournalTransaction))
         == before_journals
     )
-    assert await session.scalar(select(func.count()).select_from(Posting)) == before_postings
+    assert (
+        await session.scalar(select(func.count()).select_from(Posting))
+        == before_postings
+    )
 
 
 async def test_seed_rejects_corrupt_current_balance(session):
@@ -606,4 +598,49 @@ async def test_invariant_check_reports_negative_pending_new_account(session):
 
     with pytest.raises(AssertionError, match="negative account balance"):
         await assert_ledger_invariants(session)
+    await session.rollback()
+
+
+async def test_database_rejects_empty_journal_at_commit(session):
+    session.add(
+        JournalTransaction(
+            settlement_id=None,
+            event=JournalEvent.OPENING,
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.commit()
+    await session.rollback()
+
+
+async def test_database_rejects_posted_posting_update(seeded_accounts, session):
+    posting_id = await session.scalar(select(Posting.id).limit(1))
+
+    with pytest.raises(IntegrityError, match="postings are immutable"):
+        await session.execute(
+            update(Posting)
+            .where(Posting.id == posting_id)
+            .values(amount=Decimal("999"))
+        )
+    await session.rollback()
+
+
+async def test_database_rejects_posted_posting_delete(seeded_accounts, session):
+    posting_id = await session.scalar(select(Posting.id).limit(1))
+
+    with pytest.raises(IntegrityError, match="postings are immutable"):
+        await session.execute(delete(Posting).where(Posting.id == posting_id))
+    await session.rollback()
+
+
+async def test_database_rejects_posted_journal_update(seeded_accounts, session):
+    journal_id = await session.scalar(select(JournalTransaction.id).limit(1))
+
+    with pytest.raises(IntegrityError, match="posted journals are immutable"):
+        await session.execute(
+            update(JournalTransaction)
+            .where(JournalTransaction.id == journal_id)
+            .values(event=JournalEvent.OPENING)
+        )
     await session.rollback()

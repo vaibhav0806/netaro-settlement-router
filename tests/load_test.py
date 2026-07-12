@@ -16,22 +16,21 @@ import httpx
 
 from app.routing import Currency, compute_routes, generate_edges
 
-
 OWNER_ID = "demo-customer"
 EXPECTED = {
     "settlements": 1000,
-    "SUCCESS": 700,
+    "SUCCESS": 850,
     "FAILED": 150,
-    "PENDING_RECONCILIATION": 150,
+    "PENDING_RECONCILIATION": 0,
     "RESERVE": 1000,
-    "CONSUME": 700,
+    "CONSUME": 850,
     "RELEASE": 150,
     "OPENING": 1,
-    "settlement_journals": 1850,
-    "total_journals_including_opening": 1851,
+    "settlement_journals": 2000,
+    "total_journals_including_opening": 2001,
     "available_usd": Decimal("15000"),
-    "reserved_usd": Decimal("15000"),
-    "successful_usd": Decimal("70000"),
+    "reserved_usd": Decimal("0"),
+    "successful_usd": Decimal("85000"),
 }
 MONEY_QUANTUM = Decimal("0.00000001")
 
@@ -104,13 +103,48 @@ async def send_requests(
                     },
                     json={"amount_usd": str(amount), "target_currency": "PHP"},
                 )
-            if response.status_code != 200:
+            if response.status_code not in {200, 202}:
                 raise AssertionError(
                     f"HTTP settlement failure: {response.status_code} {response.text}"
                 )
             return response.json()
 
         return await asyncio.gather(*(send_one() for _ in range(requests)))
+
+
+async def wait_for_terminal(
+    base_url: str,
+    settlement_ids: set[str],
+    *,
+    timeout_seconds: float = 30,
+) -> None:
+    pending = set(settlement_ids)
+    deadline = time.monotonic() + timeout_seconds
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        timeout=http_timeout(),
+    ) as client:
+        while pending and time.monotonic() < deadline:
+            responses = await asyncio.gather(
+                *(client.get(f"/settlements/{item}") for item in pending)
+            )
+            next_pending = set()
+            for response in responses:
+                response.raise_for_status()
+                body = response.json()
+                if body["status"] in {
+                    "PAYOUT_IN_PROGRESS",
+                    "PENDING_RECONCILIATION",
+                }:
+                    next_pending.add(body["id"])
+            pending = next_pending
+            if pending:
+                await asyncio.sleep(0.1)
+    if pending:
+        raise RuntimeError(
+            f"{len(pending)} settlements remained unresolved after "
+            f"{timeout_seconds} seconds"
+        )
 
 
 def verify_route(row: asyncpg.Record) -> None:
@@ -357,6 +391,13 @@ async def run(args: argparse.Namespace) -> None:
         len({item["id"] for item in responses}),
         1000,
     )
+    initial_statuses = Counter(item["status"] for item in responses)
+    require_equal(
+        "initial HTTP settlement statuses",
+        initial_statuses,
+        Counter({"SUCCESS": 700, "PENDING_RECONCILIATION": 300}),
+    )
+    await wait_for_terminal(args.base_url, {item["id"] for item in responses})
     result = await audit(args.database_url)
     statuses = result["statuses"]
     print(

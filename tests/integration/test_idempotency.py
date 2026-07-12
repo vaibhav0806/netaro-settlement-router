@@ -3,6 +3,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from conftest import ScriptedPayoutProvider
 from sqlalchemy import func, select, text
 
 from app.ledger import reserve
@@ -12,7 +13,6 @@ from app.routing import Currency, Edge
 from app.schemas import SettlementCreate, request_fingerprint
 from app.seed import seed_demo_accounts
 from app.service import IdempotencyConflict, SettlementService
-from conftest import ScriptedPayoutProvider
 
 
 def command(amount: str = "40", target: Currency = Currency.PHP) -> SettlementCreate:
@@ -33,9 +33,7 @@ async def test_owner_idempotency_constraint_has_stable_name(
     assert constraint_name == "uq_settlements_owner_idempotency_key"
 
 
-async def test_same_key_is_scoped_to_owner(
-    clean_database, session_factory, rate_book
-):
+async def test_same_key_is_scoped_to_owner(clean_database, session_factory, rate_book):
     requested = command()
     quote = rate_book.quote(requested.target_currency)
     settlements = []
@@ -63,9 +61,7 @@ async def test_same_key_is_scoped_to_owner(
         await session.commit()
         persisted = (
             await session.scalars(
-                select(Settlement).where(
-                    Settlement.idempotency_key == "shared-key"
-                )
+                select(Settlement).where(Settlement.idempotency_key == "shared-key")
             )
         ).all()
 
@@ -88,10 +84,7 @@ async def test_concurrent_conflicting_payloads_have_one_winner(
 
     results = await asyncio.wait_for(
         asyncio.gather(
-            *(
-                service.create("customer", "contested", request)
-                for request in requests
-            ),
+            *(service.create("customer", "contested", request) for request in requests),
             return_exceptions=True,
         ),
         timeout=20,

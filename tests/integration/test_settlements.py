@@ -2,7 +2,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-
+from conftest import ScriptedPayoutProvider
 from sqlalchemy import func, select
 
 from app.models import (
@@ -23,13 +23,10 @@ from app.routing import Currency
 from app.schemas import SettlementCreate
 from app.seed import seed_demo_accounts
 from app.service import SettlementService
-from conftest import ScriptedPayoutProvider
 
 
 class InitiationFailureProvider:
-    async def initiate(
-        self, settlement_id, amount_usd, target_currency, quoted_amount
-    ):
+    async def initiate(self, settlement_id, amount_usd, target_currency, quoted_amount):
         raise RuntimeError("provider initiation failed")
 
     async def lookup(self, settlement_id):
@@ -159,30 +156,23 @@ async def test_timeout_preserves_reservation_for_reconciliation(
     assert events == {JournalEvent.RESERVE}
 
 
-async def test_unexpected_initiation_failure_preserves_in_progress_reservation(
+async def test_unexpected_initiation_failure_enters_reconciliation(
     clean_database, session_factory, rate_book
 ):
     async with session_factory() as session:
         await seed_demo_accounts(session, "customer", Decimal("100"))
         await session.commit()
-    service = SettlementService(
-        session_factory, rate_book, InitiationFailureProvider()
-    )
+    service = SettlementService(session_factory, rate_book, InitiationFailureProvider())
 
-    with pytest.raises(RuntimeError, match="provider initiation failed"):
-        await service.create(
-            "customer",
-            "runtime-failure",
-            SettlementCreate(
-                amount_usd=Decimal("40"), target_currency=Currency.PHP
-            ),
-        )
+    result = await service.create(
+        "customer",
+        "runtime-failure",
+        SettlementCreate(amount_usd=Decimal("40"), target_currency=Currency.PHP),
+    )
 
     async with session_factory() as session:
         settlement = await session.scalar(
-            select(Settlement).where(
-                Settlement.idempotency_key == "runtime-failure"
-            )
+            select(Settlement).where(Settlement.idempotency_key == "runtime-failure")
         )
         balances = dict(
             (
@@ -200,7 +190,8 @@ async def test_unexpected_initiation_failure_preserves_in_progress_reservation(
                 )
             )
         ).all()
-    assert settlement.status == SettlementStatus.PAYOUT_IN_PROGRESS
+    assert result.status == SettlementStatus.PENDING_RECONCILIATION
+    assert settlement.status == SettlementStatus.PENDING_RECONCILIATION
     assert balances[AccountPurpose.AVAILABLE] == Decimal("60")
     assert balances[AccountPurpose.RESERVED] == Decimal("40")
     assert events == [JournalEvent.RESERVE]
@@ -266,5 +257,41 @@ async def test_mock_provider_default_demo_distribution_is_deterministic():
             results.append(None)
 
     assert results.count(ProviderResult.PAID) == 14
-    assert results.count(ProviderResult.UNPAID) == 3
+    assert results.count(ProviderResult.AMBIGUOUS) == 3
     assert results.count(None) == 3
+
+
+async def test_durable_mock_provider_survives_instance_restart(
+    clean_database, session_factory
+):
+    provider = MockPayoutProvider(
+        sessions=session_factory,
+        timeout_seconds=0,
+    )
+    settlement_ids = [uuid4() for _ in range(20)]
+
+    results = []
+    for settlement_id in settlement_ids:
+        try:
+            results.append(
+                await provider.initiate(
+                    settlement_id,
+                    Decimal("1"),
+                    Currency.PHP,
+                    Decimal("55"),
+                )
+            )
+        except PayoutTimeout:
+            results.append(None)
+
+    restarted = MockPayoutProvider(
+        sessions=session_factory,
+        timeout_seconds=0,
+    )
+
+    assert results.count(ProviderResult.PAID) == 14
+    assert results.count(ProviderResult.AMBIGUOUS) == 3
+    assert results.count(None) == 3
+    lookups = [await restarted.lookup(item) for item in settlement_ids]
+    assert lookups.count(ProviderLookup.PAID) == 17
+    assert lookups.count(ProviderLookup.UNPAID) == 3

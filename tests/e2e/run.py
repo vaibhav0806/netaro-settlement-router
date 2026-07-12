@@ -10,10 +10,10 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 from uuid import uuid4
@@ -42,12 +42,8 @@ SCENARIOS = {
     spec.name: spec
     for spec in (
         ScenarioSpec("boot-contract", "load", "boot_contract"),
-        ScenarioSpec(
-            "settlement-idempotency", "load", "settlement_idempotency"
-        ),
-        ScenarioSpec(
-            "provider-reconciliation", "random", "provider_reconciliation"
-        ),
+        ScenarioSpec("settlement-idempotency", "load", "settlement_idempotency"),
+        ScenarioSpec("provider-reconciliation", "random", "provider_reconciliation"),
         ScenarioSpec(
             "concurrency-funds",
             "load",
@@ -239,7 +235,9 @@ def capture_artifacts(
         "db.log": compose_command(config, "logs", "--no-color", "db"),
     }
     for name, command in evidence_commands.items():
-        (config.artifact_dir / name).write_text(_redact(_command_output(command, config)))
+        (config.artifact_dir / name).write_text(
+            _redact(_command_output(command, config))
+        )
 
     git_sha = _command_output(["git", "rev-parse", "HEAD"], config).strip()
     dirty = bool(_command_output(["git", "status", "--porcelain"], config).strip())
@@ -322,6 +320,8 @@ SELECT 'duplicate_events=' || count(*) FROM (
   WHERE settlement_id IS NOT NULL GROUP BY settlement_id, event
   HAVING count(*) > 1
 ) duplicate_rows;
+SELECT 'unposted_journals=' || count(*)
+FROM journal_transactions WHERE is_posted = false;
 COMMIT;
 """
     return _run(
@@ -348,16 +348,16 @@ COMMIT;
 
 def _verify_lifecycle(config: RunConfig) -> subprocess.CompletedProcess[str]:
     settlement_ids = (
-        config.artifact_dir / "lifecycle-settlement-id.txt"
-    ).read_text().splitlines()
-    pending_id = settlement_ids[1]
-    outputs: list[str] = []
-    restart = _run(
-        compose_command(config, "restart", "api"), env=_environment(config)
+        (config.artifact_dir / "lifecycle-settlement-id.txt").read_text().splitlines()
     )
+    formerly_pending_id = settlement_ids[1]
+    outputs: list[str] = []
+    restart = _run(compose_command(config, "restart", "api"), env=_environment(config))
     outputs.append(restart.stdout + restart.stderr)
     if restart.returncode:
-        return subprocess.CompletedProcess([], restart.returncode, "".join(outputs), restart.stderr)
+        return subprocess.CompletedProcess(
+            [], restart.returncode, "".join(outputs), restart.stderr
+        )
     try:
         wait_for_health(config)
     except TimeoutError as error:
@@ -369,31 +369,23 @@ def _verify_lifecycle(config: RunConfig) -> subprocess.CompletedProcess[str]:
         )
         outputs.append(f"post_restart_get={status} {body}\n")
         if status != 200:
-            return subprocess.CompletedProcess([], 1, "".join(outputs), "persistence check failed")
+            return subprocess.CompletedProcess(
+                [], 1, "".join(outputs), "persistence check failed"
+            )
+        if settlement_id == formerly_pending_id and (
+            not isinstance(body, dict)
+            or body.get("status") not in {"SUCCESS", "FAILED"}
+        ):
+            return subprocess.CompletedProcess(
+                [], 1, "".join(outputs), "automatic recovery did not finalize"
+            )
 
-    status, body = _default_health_request(
-        f"http://127.0.0.1:{config.api_host_port}/settlements/{pending_id}/reconcile"
-    )
-    if status == 405:
-        reconcile = _run(
-            [
-                sys.executable,
-                "-c",
-                "import httpx,sys; r=httpx.post(sys.argv[1],timeout=10); "
-                "print(r.status_code, r.text); raise SystemExit(r.status_code != 200)",
-                f"http://127.0.0.1:{config.api_host_port}/settlements/{pending_id}/reconcile",
-            ]
-        )
-        outputs.append(reconcile.stdout + reconcile.stderr)
-        if reconcile.returncode or "PENDING_RECONCILIATION" not in reconcile.stdout:
-            return subprocess.CompletedProcess([], 1, "".join(outputs), "pending recovery changed state")
-
-    stop = _run(
-        compose_command(config, "stop", "db"), env=_environment(config)
-    )
+    stop = _run(compose_command(config, "stop", "db"), env=_environment(config))
     outputs.append(stop.stdout + stop.stderr)
     if stop.returncode:
-        return subprocess.CompletedProcess([], stop.returncode, "".join(outputs), stop.stderr)
+        return subprocess.CompletedProcess(
+            [], stop.returncode, "".join(outputs), stop.stderr
+        )
 
     deadline = time.monotonic() + 10
     health_status = 0
@@ -407,17 +399,21 @@ def _verify_lifecycle(config: RunConfig) -> subprocess.CompletedProcess[str]:
         time.sleep(0.25)
     outputs.append(f"database_down_health={health_status} {health_body}\n")
     if health_status != 503:
-        return subprocess.CompletedProcess([], 1, "".join(outputs), "expected health 503")
+        return subprocess.CompletedProcess(
+            [], 1, "".join(outputs), "expected health 503"
+        )
 
     start = _run(compose_command(config, "start", "db"), env=_environment(config))
     outputs.append(start.stdout + start.stderr)
     if start.returncode:
-        return subprocess.CompletedProcess([], start.returncode, "".join(outputs), start.stderr)
+        return subprocess.CompletedProcess(
+            [], start.returncode, "".join(outputs), start.stderr
+        )
     try:
         wait_for_health(config)
     except TimeoutError as error:
         return subprocess.CompletedProcess([], 1, "".join(outputs), str(error))
-    outputs.append(f"database_recovered_health=200\n")
+    outputs.append("database_recovered_health=200\n")
     return subprocess.CompletedProcess([], 0, "".join(outputs), "")
 
 
@@ -444,18 +440,12 @@ def run_scenario(spec: ScenarioSpec, *, config: RunConfig | None = None) -> int:
                     startup_succeeded = True
                     break
                 if not _is_port_collision(up.stderr) or attempt == 2:
-                    _persist(
-                        active_config.artifact_dir / "scenario.stdout", up.stdout
-                    )
-                    _persist(
-                        active_config.artifact_dir / "scenario.stderr", up.stderr
-                    )
+                    _persist(active_config.artifact_dir / "scenario.stdout", up.stdout)
+                    _persist(active_config.artifact_dir / "scenario.stderr", up.stderr)
                     outcome = up.returncode or 1
                     break
                 cleanup = _run(
-                    compose_command(
-                        active_config, "down", "-v", "--remove-orphans"
-                    ),
+                    compose_command(active_config, "down", "-v", "--remove-orphans"),
                     env=_environment(active_config),
                 )
                 _persist(
@@ -479,14 +469,10 @@ def run_scenario(spec: ScenarioSpec, *, config: RunConfig | None = None) -> int:
                             f"http://127.0.0.1:{active_config.api_host_port}"
                         ),
                         "E2E_SCENARIO": spec.name,
-                        "E2E_ARTIFACT_DIR": str(
-                            active_config.artifact_dir.resolve()
-                        ),
+                        "E2E_ARTIFACT_DIR": str(active_config.artifact_dir.resolve()),
                     }
                 )
-                scenario = _run(
-                    _scenario_command(spec), env=scenario_environment
-                )
+                scenario = _run(_scenario_command(spec), env=scenario_environment)
                 if scenario.returncode == 0 and spec.name == "lifecycle-recovery":
                     lifecycle = _verify_lifecycle(active_config)
                     scenario = subprocess.CompletedProcess(
@@ -507,6 +493,7 @@ def run_scenario(spec: ScenarioSpec, *, config: RunConfig | None = None) -> int:
                         "unbalanced_groups=0",
                         "duplicate_owner_keys=0",
                         "duplicate_events=0",
+                        "unposted_journals=0",
                     }
                     observed = set(audit.stdout.splitlines())
                     if audit.returncode or not expected <= observed:

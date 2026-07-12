@@ -1,14 +1,13 @@
 import os
 from collections.abc import AsyncIterator
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
-
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -29,7 +28,7 @@ async def check_database(
     try:
         async with sessions() as session:
             await session.execute(text("SELECT 1"))
-    except SQLAlchemyError as error:
+    except (SQLAlchemyError, OSError) as error:
         raise DatabaseUnavailable from error
 
 

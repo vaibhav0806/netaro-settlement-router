@@ -3,6 +3,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from conftest import ScriptedPayoutProvider
 from sqlalchemy import select
 
 from app.ledger import reserve
@@ -11,6 +12,7 @@ from app.models import (
     AccountPurpose,
     JournalEvent,
     JournalTransaction,
+    PayoutAttempt,
     Settlement,
     SettlementStatus,
 )
@@ -19,16 +21,12 @@ from app.routing import Currency
 from app.schemas import SettlementCreate, request_fingerprint
 from app.seed import seed_demo_accounts
 from app.service import SettlementNotFound, SettlementService
-from conftest import ScriptedPayoutProvider
-
 
 COMMAND = SettlementCreate(amount_usd=Decimal("40"), target_currency=Currency.PHP)
 
 
 class LookupFailureProvider:
-    async def initiate(
-        self, settlement_id, amount_usd, target_currency, quoted_amount
-    ):
+    async def initiate(self, settlement_id, amount_usd, target_currency, quoted_amount):
         raise AssertionError("initiate must not be called")
 
     async def lookup(self, settlement_id):
@@ -81,9 +79,7 @@ async def test_unknown_reconciliation_preserves_pending_reservation(
     async with session_factory() as session:
         await seed_demo_accounts(session, "customer", Decimal("100"))
         await session.commit()
-    provider = ScriptedPayoutProvider(
-        PayoutTimeout(), (ProviderLookup.UNKNOWN,)
-    )
+    provider = ScriptedPayoutProvider(PayoutTimeout(), (ProviderLookup.UNKNOWN,))
     service, pending = await create_pending(session_factory, rate_book, provider)
 
     result = await service.reconcile(pending.id)
@@ -99,6 +95,44 @@ async def test_unknown_reconciliation_preserves_pending_reservation(
             )
         )
     assert reserved == Decimal("40")
+
+
+async def test_pending_settlement_has_durable_fenced_attempt(
+    clean_database, session_factory, rate_book
+):
+    async with session_factory() as session:
+        await seed_demo_accounts(session, "customer", Decimal("100"))
+        await session.commit()
+    provider = ScriptedPayoutProvider(PayoutTimeout())
+    _, pending = await create_pending(session_factory, rate_book, provider)
+
+    async with session_factory() as session:
+        attempt = await session.get(PayoutAttempt, pending.id)
+
+    assert attempt is not None
+    assert attempt.operation_id == pending.id
+    assert attempt.attempt_token == 1
+    assert attempt.state == "RECONCILING"
+    assert attempt.lease_expires_at is not None
+
+
+async def test_reconciliation_worker_resolves_pending_operation(
+    clean_database, session_factory, rate_book
+):
+    async with session_factory() as session:
+        await seed_demo_accounts(session, "customer", Decimal("100"))
+        await session.commit()
+    provider = ScriptedPayoutProvider(
+        PayoutTimeout(),
+        (ProviderLookup.PAID,),
+    )
+    service, pending = await create_pending(session_factory, rate_book, provider)
+
+    claimed = await service.run_reconciliation_once()
+
+    assert claimed == 1
+    assert (await service.get(pending.id)).status == SettlementStatus.SUCCESS
+    assert provider.lookup_calls == [pending.id]
 
 
 async def test_repeated_unknown_reconciliation_is_a_noop(
@@ -153,7 +187,12 @@ async def test_concurrent_unpaid_reconciliation_releases_once(
         timeout=20,
     )
 
-    assert all(result.status == SettlementStatus.FAILED for result in results)
+    assert {result.status for result in results} <= {
+        SettlementStatus.PENDING_RECONCILIATION,
+        SettlementStatus.FAILED,
+    }
+    assert (await service.get(pending.id)).status == SettlementStatus.FAILED
+    assert provider.lookup_calls == [pending.id]
     async with session_factory() as session:
         balances = dict(
             (
@@ -283,7 +322,7 @@ async def test_definitive_reconciliation_finalizes_exactly_once(
     [
         (ProviderLookup.PAID, SettlementStatus.SUCCESS, 0),
         (ProviderLookup.UNPAID, SettlementStatus.FAILED, 0),
-        (ProviderLookup.UNKNOWN, SettlementStatus.PAYOUT_IN_PROGRESS, 0),
+        (ProviderLookup.UNKNOWN, SettlementStatus.PENDING_RECONCILIATION, 0),
         (ProviderLookup.NOT_FOUND, SettlementStatus.SUCCESS, 1),
     ],
 )
