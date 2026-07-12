@@ -80,9 +80,9 @@ The full evidence, exact source revision, and coverage matrix are in
 | Combined unit and integration | 129 passed |
 | Isolated Docker E2E scenarios | 5 passed |
 | Canonical load workload | 1,000/1,000 requests completed |
-| Load duration | 11.76 seconds |
+| Load duration | 11.13 seconds |
 | Final provider outcomes | 850 success / 150 failed / 0 pending |
-| Routing snapshots exercised | 59 |
+| Routing snapshots exercised | 54 |
 | Ledger journals | 1 opening + 2,000 settlement journals |
 | Final available/reserved USD | 15,000 / 0 |
 | Negative accounts | 0 |
